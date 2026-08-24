@@ -67,13 +67,14 @@ the point: **measure before believing anyone's screenshot, including this one.**
 
 ## Where the money actually goes
 
-```mermaid
-pie showData
-    title Real 7-day spend decomposition (970 sessions)
-    "cache_read — context re-read every iteration" : 50.5
-    "cache_write warm — in-turn deltas" : 27.4
-    "cache_write cold — idle wakes" : 11.3
-    "output" : 10.7
+Real 7-day decomposition, 970 sessions:
+
+```
+cache_read   — context re-read every iteration  ████████████████████░░░░░░░░░░░░░░░░░░░░  50.5%
+cache_write  — warm, in-turn deltas             ███████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  27.4%
+cache_write  — cold, idle wakes                 █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  11.3%
+output       — what the screenshots optimize    ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  10.7%
+input        — uncached                         ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.1%
 ```
 
 Most "token saver" tools optimize **output** — the 10% slice. The bill is
