@@ -38,6 +38,11 @@ import sys
 
 CTX_THRESHOLD = int(os.environ.get("FOREMAN_CTX_TOKENS", "150000"))
 IDLE_S = int(os.environ.get("FOREMAN_IDLE_S", "3600"))
+# Urgent tier: an extreme session gets cleaned at the first SHORT pause instead
+# of waiting for the hour — at this size, every agentic iteration re-reads the
+# whole thing, so the one-off compaction latency pays for itself immediately.
+CTX_URGENT = int(os.environ.get("FOREMAN_CTX_URGENT", "500000"))
+IDLE_URGENT_S = int(os.environ.get("FOREMAN_IDLE_URGENT_S", "600"))
 MODE = os.environ.get("FOREMAN_MODE", "advise").lower()
 
 SURGICAL = (
@@ -111,10 +116,14 @@ def main():
         return
     sid = os.path.basename(transcript)[:8]
     ctx, idle = last_state(transcript)
-    if ctx < CTX_THRESHOLD or idle < IDLE_S:
-        _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> pass (thresholds {CTX_THRESHOLD // 1000}K/{IDLE_S // 60}m)")
+    scheduled = ctx >= CTX_THRESHOLD and idle >= IDLE_S
+    urgent = ctx >= CTX_URGENT and idle >= IDLE_URGENT_S
+    if not (scheduled or urgent):
+        _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> pass "
+             f"(idle-tier {CTX_THRESHOLD // 1000}K/{IDLE_S // 60}m · urgent-tier {CTX_URGENT // 1000}K/{IDLE_URGENT_S // 60}m)")
         return
-    _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> FIRE mode={MODE}")
+    why = "urgent" if urgent and not scheduled else "idle"
+    _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> FIRE({why}) mode={MODE}")
 
     ctx_k = ctx // 1000
     idle_h = idle / 3600

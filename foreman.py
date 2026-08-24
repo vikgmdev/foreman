@@ -15,6 +15,7 @@ Usage:
   foreman hook install|uninstall|status    manage the context-sentinel hook
   foreman restart [--go]                   recycle idle tmux sessions in place
   foreman session <id|project>             one session's card: context, cost, compactions
+  foreman savings                          $ actually saved by sentinel-triggered compactions
   foreman update                           update foreman itself
   foreman version
 
@@ -919,6 +920,135 @@ def _session_card(path, prof):
         print("\nno compaction events detected in this transcript yet.")
 
 
+
+
+# ─────────────────────────── attributed savings ────────────────────────────
+# Cross-reference the sentinel's FIRE log with what actually happened next in
+# each session's transcript: a context drop shortly after a FIRE is attributed
+# to foreman, and the savings REALIZED so far are computed from the calls that
+# actually ran on the smaller context afterwards (counterfactual: same calls
+# at the pre-drop size). Measured, not projected.
+
+def _parse_sentinel_log():
+    logp = os.path.join(STATE_DIR, "sentinel.log")
+    fires, passes = [], 0
+    if not os.path.exists(logp):
+        return fires, passes
+    pat = re.compile(r"(\S+) session=(\S+) ctx=(\d+)K idle=(\d+)m -> (\w+)")
+    for line in open(logp):
+        m = pat.match(line.strip())
+        if not m:
+            continue
+        ts, sid, ctx, idle, dec = m.groups()
+        if dec.startswith("FIRE"):
+            fires.append({"ts": ts, "sid": sid, "ctx": int(ctx) * 1000})
+        elif dec == "pass":
+            passes += 1
+    return fires, passes
+
+
+def _find_by_prefix(sid):
+    for prof in discover_profiles():
+        hits = glob.glob(os.path.join(prof, "projects", "*", sid + "*.jsonl"))
+        if hits:
+            return max(hits, key=os.path.getmtime)
+    return None
+
+
+def cmd_savings():
+    fires, passes = _parse_sentinel_log()
+    print(f"foreman savings — attributed to sentinel FIREs "
+          f"(log: {os.path.join(STATE_DIR, 'sentinel.log')})")
+    print(f"  sentinel invocations: {passes + len(fires):,} ({len(fires)} FIRE, {passes:,} pass)\n")
+    if not fires:
+        print("no FIRE events yet — savings attribution starts with the first one.")
+        print("(a FIRE happens when you message a session that is >150K resident and")
+        print(" idle >1h; watch: tail -f ~/.local/state/foreman/sentinel.log)")
+        return
+
+    total_shed = 0
+    total_saved = 0.0
+    attributed = 0
+    seen = set()
+    for f in fires:
+        key = f["sid"]
+        path = _find_by_prefix(f["sid"])
+        if not path:
+            print(f"  {f['ts']}  {f['sid']}: transcript not found (test entry?) — skipped")
+            continue
+        try:
+            fire_t = datetime.datetime.fromisoformat(f["ts"])
+        except ValueError:
+            continue
+        # walk the transcript from the FIRE moment forward
+        drop_a = drop_b = None
+        saved = 0.0
+        prev_ctx = 0
+        prev_t = None
+        n_after = 0
+        with open(path, errors="ignore") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                msg = d.get("message") or {}
+                u = msg.get("usage") or {}
+                if not u:
+                    continue
+                t = parse_ts(d.get("timestamp", ""))
+                if not t:
+                    continue
+                tn = t.replace(tzinfo=None)
+                ctx = (u.get("input_tokens", 0) or 0) + \
+                      (u.get("cache_read_input_tokens", 0) or 0) + \
+                      (u.get("cache_creation_input_tokens", 0) or 0)
+                pi, pw, pr, po = PRICES[tier(msg.get("model"))]
+                if tn < fire_t:
+                    prev_ctx = ctx or prev_ctx
+                    prev_t = tn
+                    continue
+                if drop_a is None:
+                    # look for the drop within 15 min of the FIRE
+                    if (tn - fire_t).total_seconds() > 900 and not (
+                            prev_ctx > 150_000 and ctx < prev_ctx * 0.7):
+                        break  # no compaction followed this FIRE
+                    if prev_ctx > 150_000 and ctx and ctx < prev_ctx * 0.7:
+                        drop_a, drop_b = prev_ctx, ctx
+                    prev_ctx = ctx or prev_ctx
+                    prev_t = tn
+                    if drop_a is None:
+                        continue
+                    continue
+                # after the drop: realized savings on every call still below a
+                if ctx >= drop_a:
+                    break  # context regrew past the old size — stop attributing
+                n_after += 1
+                saved += (drop_a - ctx) * pr / 1e6
+                if prev_t and (tn - prev_t).total_seconds() > TTL_S:
+                    saved += (drop_a - ctx) * pw / 1e6  # a cold rewrite that was smaller
+                prev_t = tn
+        if drop_a:
+            attributed += 1
+            total_shed += drop_a - drop_b
+            total_saved += saved
+            dedupe = " (repeat)" if key in seen else ""
+            seen.add(key)
+            print(f"  {f['ts']}  {f['sid']}: {drop_a // 1000}K → {drop_b // 1000}K "
+                  f"(shed {(drop_a - drop_b) // 1000}K) · {n_after} calls since · "
+                  f"realized {fmt_money(saved)}{dedupe}")
+        else:
+            print(f"  {f['ts']}  {f['sid']}: FIRE but no compaction followed "
+                  f"(model may lack SlashCommand, or advise was ignored)")
+    print(f"\n  attributed compactions: {attributed}/{len(fires)} · "
+          f"context shed: {total_shed / 1000:,.0f}K tokens · "
+          f"REALIZED savings so far: {fmt_money(total_saved)}")
+    print("  (realized = actual calls that ran cheaper than the pre-compaction size;")
+    print("   it grows every time those sessions keep working. Re-run anytime.)")
+
+
 # ──────────────────────────────── update ───────────────────────────────────
 
 def cmd_update():
@@ -960,6 +1090,7 @@ def main():
                     help="ignore the idle check (NOT recommended)")
     sp = sub.add_parser("session")
     sp.add_argument("match", nargs="?", help="session-id prefix, project-dir substring, or transcript path")
+    sub.add_parser("savings")
     sub.add_parser("update")
     sub.add_parser("version")
 
@@ -973,6 +1104,8 @@ def main():
         cmd_ls()
     elif a.cmd == "hook":
         cmd_hook(a.action, a.profile, a.mode)
+    elif a.cmd == "savings":
+        cmd_savings()
     elif a.cmd == "session":
         cmd_session(a.match)
     elif a.cmd == "restart":
