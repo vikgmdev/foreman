@@ -2,50 +2,57 @@
 """
 foreman context sentinel — a UserPromptSubmit hook for Claude Code.
 
-THE INSIGHT THIS AUTOMATES: after an idle gap longer than the prompt-cache TTL
-(5 min), your next message pays a full-context rewrite ANYWAY — the cache is
-already dead. That makes every post-idle wake a FREE compaction point: cleaning
-the session at that exact moment costs almost nothing extra, and everything
-after it runs on a fraction of the context. Long-running, mostly-idle sessions
-(the multi-project tmux pattern) hit this constantly.
+THE INSIGHT THIS AUTOMATES: long-running sessions accumulate stale tool
+traffic (75-80% of resident context in measured whales, ~99% of it >30 turns
+old). Every agentic iteration re-reads all of it. Compacting surgically keeps
+the dialogue and working state while shedding the dead weight.
 
-WHAT IT DOES: when you submit a prompt to a session whose resident context
-exceeds FOREMAN_CTX_TOKENS *and* that has been idle longer than FOREMAN_IDLE_S,
-it intervenes, in one of two modes (FOREMAN_MODE):
+TIERS (checked when you message a session):
+  idle tier    ctx >= FOREMAN_CTX_TOKENS (150K) and idle >= FOREMAN_IDLE_S (1h)
+               — the calm, free moment: the cache is cold anyway.
+  urgent tier  ctx >= FOREMAN_CTX_URGENT (500K), NO idle required — at this
+               size one more busy turn costs more than the compaction pass.
 
-  advise (default) : injects context telling the model to surgically compact
-                     first (keep the dialogue and recent turns; drop stale tool
-                     traffic — measured at 75-80% of long sessions, ~99% stale),
-                     then handle your request.
-  block            : bounces your prompt back with the exact /compact command to
-                     run first. Zero-trust mode: nothing happens automatically.
+MODES (FOREMAN_MODE):
+  auto (default) — fully automatic when the session lives in a tmux pane:
+                   the hook BLOCKS your prompt (saving it first), types the
+                   surgical /compact into the pane, waits for it to finish,
+                   then resends your original message. No model cooperation
+                   required. Falls back to advise outside tmux or when a
+                   previous attempt is already in flight.
+  advise         — inject instructions asking the model to compact first
+                   (works everywhere; depends on the model following through).
+  block          — bounce the prompt back with the exact /compact to run.
+  off            — disabled.
 
-Config (env, all optional):
-  FOREMAN_CTX_TOKENS  resident-context threshold (default 150000)
-  FOREMAN_IDLE_S      idle threshold in seconds  (default 3600)
-  FOREMAN_MODE        advise | block | off       (default advise)
+SAFETY (auto mode): the prompt text is persisted to
+~/.local/state/foreman/pending-<sid> BEFORE anything else and only deleted
+after a successful resend — a failure can never lose what you typed. An
+in-flight marker (10 min) prevents block/compact loops. The orchestrator only
+types when the pane is verifiably calm, and gives up loudly (log + kept
+pending file) rather than guessing. NOTE: auto mode injects keystrokes into
+your own tmux panes — read orchestrate() before adopting it, or use
+FOREMAN_MODE=advise for a zero-injection default.
 
-Install (~/.claude/settings.json):
-  "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command",
-    "command": "python3 /path/to/foreman/hooks/context_sentinel.py" } ] } ] }
-
-Stdlib only. Fails open: any error -> exit 0, prompt proceeds untouched.
+Every invocation logs to ~/.local/state/foreman/sentinel.log.
+The hook fails open: any error and your prompt proceeds untouched.
 """
 import datetime
 import json
 import os
+import subprocess
 import sys
+import time
 
 CTX_THRESHOLD = int(os.environ.get("FOREMAN_CTX_TOKENS", "150000"))
 IDLE_S = int(os.environ.get("FOREMAN_IDLE_S", "3600"))
-# Urgent tier: an extreme session gets cleaned IMMEDIATELY — no idle required.
-# At ≥500K every agentic iteration re-reads the whole thing (~$1+ each on the
-# top tier), so even one more busy turn costs more than the one-off compaction
-# pass. It keeps firing on every message until the compaction actually lands.
-# Set FOREMAN_IDLE_URGENT_S to a number of seconds to make it politer.
 CTX_URGENT = int(os.environ.get("FOREMAN_CTX_URGENT", "500000"))
 IDLE_URGENT_S = int(os.environ.get("FOREMAN_IDLE_URGENT_S", "0"))
+# Default is 'advise' — zero keystroke injection, works everywhere. 'auto' is
+# powerful but types into your tmux panes, so it is opt-in on purpose:
+#   foreman hook install --mode auto   (or export FOREMAN_MODE=auto)
 MODE = os.environ.get("FOREMAN_MODE", "advise").lower()
+STATE_DIR = os.path.expanduser(os.environ.get("FOREMAN_STATE", "~/.local/state/foreman"))
 
 SURGICAL = (
     "keep the last 15 turns verbatim and every decision, open task, file path and "
@@ -53,10 +60,20 @@ SURGICAL = (
     "(command results, file reads, edit payloads already applied) — durable facts "
     "are already in files/memory"
 )
+COMPACT_CMD = f"/compact {SURGICAL}"
+
+
+def _log(msg):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "sentinel.log"), "a") as f:
+            ts = datetime.datetime.now().isoformat(timespec="seconds")
+            f.write(f"{ts} {msg}\n")
+    except Exception:
+        pass
 
 
 def last_state(transcript_path):
-    """(resident_tokens, idle_seconds) from the transcript's last usage entry."""
     ctx = 0
     last_ts = None
     try:
@@ -91,18 +108,61 @@ def last_state(transcript_path):
     return ctx, idle
 
 
-def _log(msg):
-    """Best-effort execution trace — the proof the sentinel ran in a session,
-    fired or not. ~/.local/state/foreman/sentinel.log, never fails the hook."""
-    try:
-        d = os.path.expanduser(os.environ.get("FOREMAN_STATE", "~/.local/state/foreman"))
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "sentinel.log"), "a") as f:
-            ts = datetime.datetime.now().isoformat(timespec="seconds")
-            f.write(f"{ts} {msg}\n")
-    except Exception:
-        pass
+# ─────────────────────────── auto-compact orchestrator ──────────────────────
 
+def _pane_calm(pane):
+    out = subprocess.run(["tmux", "capture-pane", "-t", pane, "-p"],
+                         capture_output=True, text=True).stdout
+    if "to interrupt" in out:
+        return False
+    prompts = [l for l in out.splitlines() if l.lstrip().startswith("❯")]
+    return bool(prompts) and not any(l.lstrip().lstrip("❯").strip() for l in prompts)
+
+
+def orchestrate(pane, pending_file, sid):
+    """Runs DETACHED after the hook blocked the prompt: type the surgical
+    /compact into the session's own pane, wait for it to finish, resend the
+    saved prompt. Gives up loudly (log + pending file kept) on any doubt."""
+    time.sleep(1.5)  # let the TUI settle after the block
+    deadline = time.time() + 20
+    while time.time() < deadline and not _pane_calm(pane):
+        time.sleep(1)
+    if not _pane_calm(pane):
+        _log(f"session={sid} auto: pane never settled — prompt kept at {pending_file}")
+        return
+    subprocess.run(["tmux", "send-keys", "-t", pane, "-l", COMPACT_CMD])
+    time.sleep(0.5)
+    subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"])
+    _log(f"session={sid} auto: /compact typed, waiting")
+    time.sleep(5)
+    deadline = time.time() + 360
+    while time.time() < deadline:
+        if _pane_calm(pane):
+            break
+        time.sleep(2)
+    else:
+        _log(f"session={sid} auto: compaction still running after 6m — "
+             f"prompt kept at {pending_file}; paste it manually")
+        return
+    try:
+        prompt = open(pending_file, errors="ignore").read()
+    except OSError:
+        _log(f"session={sid} auto: pending file vanished")
+        return
+    if prompt.strip():
+        # multiline-safe resend via a tmux paste buffer (consumed with -d)
+        subprocess.run(["tmux", "load-buffer", "-b", "foreman-resend", pending_file])
+        subprocess.run(["tmux", "paste-buffer", "-b", "foreman-resend", "-d", "-t", pane])
+        time.sleep(0.5)
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"])
+    try:
+        os.remove(pending_file)
+    except OSError:
+        pass
+    _log(f"session={sid} auto: compaction done, prompt resent")
+
+
+# ──────────────────────────────── the hook ──────────────────────────────────
 
 def main():
     if MODE == "off":
@@ -122,44 +182,76 @@ def main():
     urgent = ctx >= CTX_URGENT and idle >= IDLE_URGENT_S
     if not (scheduled or urgent):
         _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> pass "
-             f"(idle-tier {CTX_THRESHOLD // 1000}K/{IDLE_S // 60}m · urgent-tier {CTX_URGENT // 1000}K/{IDLE_URGENT_S // 60}m)")
+             f"(idle-tier {CTX_THRESHOLD // 1000}K/{IDLE_S // 60}m · "
+             f"urgent-tier {CTX_URGENT // 1000}K/{IDLE_URGENT_S // 60}m)")
         return
     why = "urgent" if urgent and not scheduled else "idle"
-    _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> FIRE({why}) mode={MODE}")
-
     ctx_k = ctx // 1000
-    idle_h = idle / 3600
+
+    pane = os.environ.get("TMUX_PANE", "")
+    pending = os.path.join(STATE_DIR, f"pending-{sid}")
+    in_flight = os.path.exists(pending) and (time.time() - os.path.getmtime(pending)) < 600
+
+    if MODE == "auto" and pane and not in_flight:
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(pending, "w") as f:
+                f.write(payload.get("prompt") or "")
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__),
+                 "--orchestrate", pane, pending, sid],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) mode=auto")
+            print(json.dumps({
+                "decision": "block",
+                "reason": (
+                    f"[foreman] This session holds ~{ctx_k}K tokens (mostly stale tool "
+                    f"traffic). Auto-compacting now — your message was saved and will be "
+                    f"sent automatically when it finishes (~1-2 min)."
+                ),
+            }))
+        except Exception:
+            pass  # fall through to advise below on any orchestration failure
+        else:
+            return
+
     if MODE == "block":
+        _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) mode=block")
         print(json.dumps({
             "decision": "block",
             "reason": (
-                f"[foreman] This session holds ~{ctx_k}K tokens of context and has been idle "
-                f"{idle_h:.1f}h — the prompt cache is cold, so compacting RIGHT NOW is free "
-                f"(the full rewrite was going to happen anyway). Run:\n\n"
-                f"  /compact {SURGICAL}\n\n"
-                f"…or /clear if you are between tasks. Then resend your message. "
-                f"(Disable with FOREMAN_MODE=off)"
+                f"[foreman] ~{ctx_k}K tokens resident, idle {idle / 3600:.1f}h. "
+                f"Compact first, then resend:\n\n  {COMPACT_CMD}\n\n"
+                f"(or /clear if between tasks; FOREMAN_MODE=off disables)"
             ),
         }))
         return
-    # advise mode: let the prompt through, but instruct the model to clean first.
+
+    fallback = " (auto unavailable: no tmux pane)" if MODE == "auto" and not pane else \
+               " (auto attempt already in flight)" if MODE == "auto" else ""
+    _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) mode=advise{fallback}")
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": (
-                f"[foreman] Resident context is ~{ctx_k}K tokens and this session was "
-                f"idle {idle_h:.1f}h (cache cold — compaction at this moment costs nothing extra; "
-                f"in measured long sessions 75-80% of context is tool traffic, ~99% of it stale). "
-                f"Before addressing the user's request: if a SlashCommand tool is available, run "
-                f"`/compact {SURGICAL}`. If it is not available, do NOT interrupt the task — "
-                f"finish the user's request first and then, in your final message, recommend "
-                f"running `/compact {SURGICAL}` verbatim, briefly noting the session's size."
+                f"[foreman] Resident context is ~{ctx_k}K tokens (in measured long "
+                f"sessions 75-80% is stale tool traffic). If a SlashCommand tool is "
+                f"available, run `{COMPACT_CMD}` before addressing the user's request. "
+                f"If not, finish the request first, then recommend running "
+                f"`{COMPACT_CMD}` verbatim in your final message."
             ),
         }
     }))
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 5 and sys.argv[1] == "--orchestrate":
+        try:
+            orchestrate(sys.argv[2], sys.argv[3], sys.argv[4])
+        except Exception as e:
+            _log(f"auto: orchestrator crashed: {e}")
+        sys.exit(0)
     try:
         main()
     except Exception:

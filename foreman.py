@@ -35,7 +35,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1080,7 +1080,7 @@ def main():
     hp = sub.add_parser("hook")
     hp.add_argument("action", choices=["install", "uninstall", "status"])
     hp.add_argument("--profile", help="target one config dir (default: every ~/.claude*)")
-    hp.add_argument("--mode", choices=["advise", "block"], default="advise")
+    hp.add_argument("--mode", choices=["advise", "auto", "block"], default="advise")
     rp = sub.add_parser("restart")
     rp.add_argument("--idle-min", type=int, default=30,
                     help="only recycle sessions idle at least this many minutes")
