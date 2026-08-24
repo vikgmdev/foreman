@@ -34,7 +34,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -540,15 +540,31 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
     for pid, (ppid, etimes, comm) in info.items():
         if comm != "claude":
             continue
+        # process state + invocation tell us what kind of "claude" this is
+        try:
+            state = open(f"/proc/{pid}/stat").read().split(") ")[-1].split()[0]
+        except OSError:
+            state = "?"
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="ignore")
+        except OSError:
+            argv = ""
+        kind = "tui"
+        if state == "Z" or not argv.strip():
+            kind = "zombie"      # exited but unreaped — there is no session here
+        elif " rc" in f" {argv} " or "remote-control" in argv:
+            kind = "remote"      # Remote Control client — session lives server-side, no local TUI
         env = _proc_env(pid)
-        if not env:
+        if not env and kind != "zombie":
             continue  # not ours (other user) — /proc/environ unreadable
-        cfg = env.get("CLAUDE_CONFIG_DIR", "")
+        cfg = env.get("CLAUDE_CONFIG_DIR", "") if env else ""
         profile = cfg or os.path.expanduser("~/.claude")
         try:
             cwd = os.readlink(f"/proc/{pid}/cwd")
         except OSError:
-            continue
+            if kind != "zombie":
+                continue
+            cwd = "(defunct)"
         sid, mtime = _latest_session(profile, cwd)
         idle = (now - mtime) / 60 if mtime else None
         started = now - etimes
@@ -556,7 +572,8 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         stale = os.path.exists(settings) and os.path.getmtime(settings) > started
         pane = pane_of.get(pid)
         rows.append({"pid": pid, "cfg": cfg, "profile": profile, "cwd": cwd,
-                     "sid": sid, "idle": idle, "stale": stale, "pane": pane})
+                     "sid": sid, "idle": idle, "stale": stale, "pane": pane,
+                     "kind": kind})
 
     # Sessions sharing one project dir cannot be told apart from outside the
     # process (the transcript is not held open) — resuming by "latest in dir"
@@ -581,6 +598,10 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
     print(f"{'pid':>8} {'where':20} {'idle':>6} {'hooks':7} {'shr':3} {'profile':14} cwd")
     for r in sorted(rows, key=lambda r: (r["pane"] is None, r["cwd"])):
         where = f"tmux {r['pane'][1][:14]}" if r["pane"] else "other"
+        if r["kind"] == "remote":
+            where = f"rc   {r['pane'][1][:14]}" if r["pane"] else "rc"
+        elif r["kind"] == "zombie":
+            where = f"zomb {r['pane'][1][:14]}" if r["pane"] else "zombie"
         prof = os.path.basename(r["cfg"]) if r["cfg"] else ".claude"
         # For shared project dirs the idle we can measure is the DIRECTORY's
         # (any sibling's last write) — a lower bound for this pane, so ≥.
@@ -601,6 +622,8 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         # the rest, and the resume target would be a guess. Never guess.
         # Unknown idle (no transcript found) is NOT ready either: there is
         # nothing verifiable to resume — recycling would strand the pane.
+        if r["kind"] != "tui":
+            continue  # remote-control clients and zombies are not recyclable sessions
         ready = (r["idle"] is not None and r["idle"] >= idle_min) or force
         if r["sid"] is None and not force:
             ready = False
