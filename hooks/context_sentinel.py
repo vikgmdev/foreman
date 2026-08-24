@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cc-diet context sentinel — a UserPromptSubmit hook for Claude Code.
+barnacle context sentinel — a UserPromptSubmit hook for Claude Code.
 
 THE INSIGHT THIS AUTOMATES: after an idle gap longer than the prompt-cache TTL
 (5 min), your next message pays a full-context rewrite ANYWAY — the cache is
@@ -10,8 +10,8 @@ after it runs on a fraction of the context. Long-running, mostly-idle sessions
 (the multi-project tmux pattern) hit this constantly.
 
 WHAT IT DOES: when you submit a prompt to a session whose resident context
-exceeds CC_DIET_CTX_TOKENS *and* that has been idle longer than CC_DIET_IDLE_S,
-it intervenes, in one of two modes (CC_DIET_MODE):
+exceeds BARNACLE_CTX_TOKENS *and* that has been idle longer than BARNACLE_IDLE_S,
+it intervenes, in one of two modes (BARNACLE_MODE):
 
   advise (default) : injects context telling the model to surgically compact
                      first (keep the dialogue and recent turns; drop stale tool
@@ -21,13 +21,13 @@ it intervenes, in one of two modes (CC_DIET_MODE):
                      run first. Zero-trust mode: nothing happens automatically.
 
 Config (env, all optional):
-  CC_DIET_CTX_TOKENS  resident-context threshold (default 150000)
-  CC_DIET_IDLE_S      idle threshold in seconds  (default 3600)
-  CC_DIET_MODE        advise | block | off       (default advise)
+  BARNACLE_CTX_TOKENS  resident-context threshold (default 150000)
+  BARNACLE_IDLE_S      idle threshold in seconds  (default 3600)
+  BARNACLE_MODE        advise | block | off       (default advise)
 
 Install (~/.claude/settings.json):
   "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command",
-    "command": "python3 /path/to/cc-diet/hooks/context_sentinel.py" } ] } ] }
+    "command": "python3 /path/to/barnacle/hooks/context_sentinel.py" } ] } ] }
 
 Stdlib only. Fails open: any error -> exit 0, prompt proceeds untouched.
 """
@@ -36,9 +36,9 @@ import json
 import os
 import sys
 
-CTX_THRESHOLD = int(os.environ.get("CC_DIET_CTX_TOKENS", "150000"))
-IDLE_S = int(os.environ.get("CC_DIET_IDLE_S", "3600"))
-MODE = os.environ.get("CC_DIET_MODE", "advise").lower()
+CTX_THRESHOLD = int(os.environ.get("BARNACLE_CTX_TOKENS", "150000"))
+IDLE_S = int(os.environ.get("BARNACLE_IDLE_S", "3600"))
+MODE = os.environ.get("BARNACLE_MODE", "advise").lower()
 
 SURGICAL = (
     "keep the last 15 turns verbatim and every decision, open task, file path and "
@@ -104,12 +104,12 @@ def main():
         print(json.dumps({
             "decision": "block",
             "reason": (
-                f"[cc-diet] This session holds ~{ctx_k}K tokens of context and has been idle "
+                f"[barnacle] This session holds ~{ctx_k}K tokens of context and has been idle "
                 f"{idle_h:.1f}h — the prompt cache is cold, so compacting RIGHT NOW is free "
                 f"(the full rewrite was going to happen anyway). Run:\n\n"
                 f"  /compact {SURGICAL}\n\n"
                 f"…or /clear if you are between tasks. Then resend your message. "
-                f"(Disable with CC_DIET_MODE=off)"
+                f"(Disable with BARNACLE_MODE=off)"
             ),
         }))
         return
@@ -118,7 +118,7 @@ def main():
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": (
-                f"[cc-diet sentinel] Resident context is ~{ctx_k}K tokens and this session was "
+                f"[barnacle sentinel] Resident context is ~{ctx_k}K tokens and this session was "
                 f"idle {idle_h:.1f}h (cache cold — compaction at this moment costs nothing extra; "
                 f"in measured long sessions 75-80% of context is tool traffic, ~99% of it stale). "
                 f"Before addressing the user's request: if a SlashCommand tool is available, run "
