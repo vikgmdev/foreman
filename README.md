@@ -1,151 +1,205 @@
+<div align="center">
+
 # 👷 foreman
 
-**Measure where your Claude Code tokens actually go — then cut the part that matters, automatically.**
+### Your AI agent sessions have no supervisor. Now they do.
 
-foreman reads the session transcripts Claude Code already writes on your disk,
-shows you your real cost decomposition, and installs a hook that trims dead
-context at the one moment trimming is free. Nothing leaves your machine. Zero
-dependencies. Python 3.9+.
+**foreman finds out where your Claude Code tokens actually go — then trims the
+dead weight, automatically, at the one moment trimming is free.**
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#)
+[![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#)
+[![Privacy](https://img.shields.io/badge/data-never%20leaves%20your%20machine-orange.svg)](#method-notes)
+
+</div>
+
+---
+
+## Install
 
 ```bash
-python3 foreman.py audit --deep     # where your money goes
-python3 foreman.py snapshot         # freeze a baseline
-# … install the hook, work normally for a few days …
-python3 foreman.py compare          # measured savings — or proof there were none
+curl -fsSL https://raw.githubusercontent.com/vikgmdev/foreman/main/install.sh | bash
 ```
 
-## The problem
+That's it. Then:
 
-Most token-saver tools optimize *output*. But decomposing real usage from a
-heavy multi-project setup (970 sessions, 70K API calls, 7 days), output is a
-sideshow:
+```bash
+foreman audit --deep      # see where your tokens actually go
+foreman snapshot          # freeze the "before"
+foreman hook install      # enable automatic context trimming
+foreman compare           # days later: prove the savings — or disprove them
+```
 
-| Component | Share | What it is |
-|---|---|---|
-| `cache_read` | **50.5%** | resident context re-read on **every** agentic-loop iteration |
-| `cache_write` warm | 27.4% | per-iteration deltas written to cache |
-| `cache_write` cold | 11.3% | full-context rewrite when waking a session idle past the cache TTL |
-| output | 10.7% | what most tools optimize |
-| uncached input | 0.1% | |
+<sub>Installs to `~/.foreman`, shims `foreman` into `~/.local/bin`. No root, no
+package manager, nothing phoned home. Uninstall: `foreman hook uninstall &&
+rm -rf ~/.foreman ~/.local/bin/foreman`.</sub>
 
-The bill is governed by one product:
+## What you'll see
+
+```console
+$ foreman audit
+foreman audit — last 7d across 3 profile(s)
+  970 sessions · 70,195 API calls · 3,259 cold wakes
+
+WHERE THE MONEY GOES
+  cache_read (agentic loop re-reading context)     $25,227   50.5%
+  cache_write WARM (in-turn deltas)                $13,678   27.4%
+  cache_write COLD (wake after idle > TTL)          $5,633   11.3%
+  output                                            $5,343   10.7%
+  input (uncached)                                     $53    0.1%
+  TOTAL                                            $49,933
+
+THE NUMBERS THAT PREDICT YOUR NEXT MESSAGE'S COST
+  $/user-turn (cold wake)      $15.32
+  resident ctx / call (median) 280K   p90 654K
+  fresh-session prefix floor   70K
+
+  top-10 sessions = 66.4% of all cost ($33,156)
+     $6,313   7,281 calls  max ctx   998K  acme-webapp
+     $4,625   4,326 calls  max ctx   998K  data-pipeline
+     $3,330   4,854 calls  max ctx   903K  ops-agent
+     ...
+```
+
+Real numbers from a real heavy multi-project setup. Yours will differ — that's
+the point: **measure before believing anyone's screenshot, including this one.**
+
+## Where the money actually goes
+
+```mermaid
+pie showData
+    title Real 7-day spend decomposition (970 sessions)
+    "cache_read — context re-read every iteration" : 50.5
+    "cache_write warm — in-turn deltas" : 27.4
+    "cache_write cold — idle wakes" : 11.3
+    "output" : 10.7
+```
+
+Most "token saver" tools optimize **output** — the 10% slice. The bill is
+governed by one product:
 
 ```
 cost ≈ resident_context × loop_iterations
 ```
 
-Every tool call the model makes re-reads the session's entire resident context.
-A 30-tool-call task on a 400K-token session re-reads 400K tokens thirty times.
+Every tool call the model makes re-reads the session's **entire resident
+context**. A 30-tool-call task on a 400K-token session re-reads 400K tokens
+thirty times.
 
-## What the context is actually made of
+### And the resident context is mostly garbage
 
-Autopsying the 10 most expensive sessions in that dataset (each ~1M tokens
-resident; together 66% of all spend):
+Autopsy of the 10 most expensive sessions (each ~1M tokens; together 66% of
+all spend):
 
-- **75–80% was tool traffic** — old command outputs, old file reads, edit
-  payloads applied hundreds of turns ago
-- **~99% of those tool results were more than 30 turns old** — stale by
-  construction
-- the **dialogue** — where decisions and working state actually live — was
-  only **~20%**
-
-That is the target. Dropping stale tool traffic shrinks a 1M-token session to
-~250K **without touching the conversation**. Since ~78% of cost scales linearly
-with resident size, realistic savings for long-running multi-project workflows
-are **50–70%**. Not 97% — nobody's is 97%.
-
-## The key insight: idle time makes cleanup free
-
-The prompt cache lives ~5 minutes. If you run several long-lived sessions and
-touch each one occasionally, nearly every message you send lands on a **cold
-cache** — the full-context rewrite happens anyway, no matter what you do. So:
-
-> **Right after a long idle, compaction costs nothing extra.** The expensive
-> rewrite was already going to happen. Compact then, and every iteration
-> afterwards runs on a fraction of the context.
-
-This timing also avoids auto-compact's classic failure mode — firing mid-task
-and destroying the plan you were in the middle of. A session that has been idle
-for an hour is, by definition, between things.
-
-## The tools
-
-### `foreman.py` — audit, snapshot, compare
-
-- `audit [--days 7] [--deep]` — full decomposition: cold/warm/read/write split,
-  cost per user-turn, resident context percentiles, your most expensive
-  sessions, and (with `--deep`) what their context is made of.
-- `snapshot [--tag NAME]` — freeze current metrics as a baseline.
-- `compare [--tag NAME]` — current window vs baseline. Leads with
-  **normalized metrics** ($ per user-turn, resident context per call) because
-  raw weekly totals track how much you worked, not how efficient you got.
-- `ls` — list saved snapshots.
-
-Multi-profile aware: every `~/.claude*` directory containing `projects/` is
-scanned (`CLAUDE_CONFIG_DIR` setups included), with duplicate sessions deduped.
-
-### `hooks/context_sentinel.py` — the automatic part
-
-A `UserPromptSubmit` hook. When you message a session that is **fat**
-(resident context above `FOREMAN_CTX_TOKENS`, default 150K) *and* **cold**
-(idle longer than `FOREMAN_IDLE_S`, default 1h), it intervenes:
-
-- `FOREMAN_MODE=advise` (default) — instructs the model to compact surgically
-  before doing anything else: *keep the last 15 turns and every decision, file
-  path and piece of working state verbatim; drop stale tool traffic — durable
-  facts already live in files/memory.*
-- `FOREMAN_MODE=block` — bounces your prompt back with the exact `/compact`
-  command to run; nothing happens automatically.
-- `FOREMAN_MODE=off` — disabled.
-
-The hook fails open: any error, and your prompt proceeds untouched.
-
-Install — add to `~/.claude/settings.json` (any profile):
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      { "hooks": [ { "type": "command",
-          "command": "python3 /ABSOLUTE/PATH/foreman/hooks/context_sentinel.py" } ] }
-    ]
-  }
-}
+```
+tool traffic (stale)  ██████████████████████████████░░░░░░░░  75–80%
+dialogue & decisions  ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  ~20%
 ```
 
-Note: running sessions capture hooks at startup — restart long-lived sessions
-once after installing.
+**~99% of that tool traffic was more than 30 turns old** — command outputs,
+file reads and edit payloads from hours ago, re-billed on every iteration.
+Dropping it shrinks a 1M session to ~250K **without touching the
+conversation**. Realistic savings for long-running multi-project workflows:
+**50–70%**. Not 97% — nobody's is 97%.
+
+## The trick: idle time makes cleanup free
+
+> [!TIP]
+> The prompt cache lives ~5 minutes. If you run several long-lived sessions
+> and touch each occasionally, nearly every message you send lands on a
+> **cold cache** — the full-context rewrite happens anyway. **Compacting right
+> then costs nothing extra**, and every iteration afterwards runs on a
+> fraction of the context.
+
+This timing also kills auto-compact's classic failure mode — firing mid-task
+and destroying the plan you were in the middle of. A session idle for an hour
+is, by definition, between things.
+
+`foreman hook install` puts this on autopilot: a `UserPromptSubmit` hook that
+intervenes only when a session is **fat** (>150K resident) *and* **cold**
+(idle >1h):
+
+| Mode | Behavior |
+|---|---|
+| `advise` *(default)* | instructs the model to compact surgically first — keep the last 15 turns and every decision verbatim, drop stale tool traffic |
+| `block` | bounces your prompt back with the exact `/compact` command; nothing happens without you |
+| `off` | disabled |
+
+```bash
+foreman hook install              # all profiles, advise mode
+foreman hook install --mode block # trust nothing
+foreman hook status
+foreman hook uninstall
+```
+
+The hook **fails open** — any error and your prompt proceeds untouched.
+
+> [!NOTE]
+> Running sessions capture hooks at startup — restart long-lived sessions once
+> after installing.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `foreman audit [--days N] [--deep]` | full spend decomposition; `--deep` adds whale autopsies |
+| `foreman snapshot [--tag NAME]` | freeze current metrics as a baseline |
+| `foreman compare [--tag NAME]` | now vs baseline — leads with **normalized** metrics ($/user-turn, ctx/call), because raw totals track how much you worked, not how efficient you got |
+| `foreman ls` | list saved snapshots |
+| `foreman hook install\|uninstall\|status` | manage the sentinel across every `~/.claude*` profile |
+| `foreman update` | update foreman itself |
+
+Multi-profile aware (`CLAUDE_CONFIG_DIR` setups included), duplicate sessions
+deduped.
 
 ## What else actually moves the bill (measured, in order)
 
-1. **Delegate multi-step work to subagents when the parent session is fat.**
-   A subagent runs its 30 tool calls on a ~40K context instead of the parent's
-   400K — same work, ~10× cheaper reads — and the parent doesn't grow.
-2. **Model tier.** 92% of the audited spend ran on the top-tier model; the same
-   context on the mid tier costs 5× less. Route execution-heavy work down.
-3. **Trim the fixed prefix.** Fresh sessions started at ~70K tokens *before the
-   first message* (system prompt + MCP servers + plugins + CLAUDE.md), re-read
-   by every iteration of every session. Disable unused MCP servers and plugins
-   per project; keep CLAUDE.md lean.
-4. **Parallelize tool calls.** Every merged iteration is one full context read
-   saved.
-5. **Skip these**: output-trimming proxies (they attack the ~10% slice),
-   extended 1-hour cache TTL for mostly-idle fleets (it raises *all* write
-   prices 1.25×→2× and netted **negative** on the audited mix), and per-turn
-   history pruning (editing past messages invalidates the cache prefix — you
-   pay ~12.5× to "save").
+1. **Delegate multi-step work to subagents when the parent session is fat** —
+   the subagent does its 30 tool calls on a ~40K context instead of the
+   parent's 400K. Same work, ~10× cheaper reads, and the parent doesn't grow.
+2. **Model tier** — 92% of the audited spend ran on the top-tier model; the
+   same context on the mid tier costs 5× less.
+3. **Trim the fixed prefix** — fresh sessions started at ~70K tokens *before
+   the first message* (system prompt + MCP servers + plugins + CLAUDE.md).
+   Disable what each project doesn't use.
+4. **Parallelize tool calls** — every merged iteration is one full context
+   read saved.
+5. **Skip**: output-trimming proxies (the 10% slice), extended 1h cache TTL
+   for mostly-idle fleets (raises *all* write prices 1.25×→2×; netted
+   **negative** on the audited mix), per-turn history pruning (editing the
+   past invalidates the cache prefix — you pay ~12.5× to "save").
+
+## Roadmap
+
+foreman aims to be the **site office for your AI agents** — the boring,
+load-bearing tooling that keeps agent fleets on time and within budget:
+
+- `foreman watch` — background daemon: compact idle sessions before you even
+  message them, alert on runaway context growth
+- `foreman prefix` — startup-context analyzer: what those ~70K tokens are made
+  of, per profile, and what to cut
+- Fleet budgets — per-project / per-agent spend tracking and limits
+- Support for more agent harnesses beyond Claude Code
 
 ## Method notes
+
+<details>
+<summary>Pricing, assumptions, and what gets read</summary>
 
 - Prices are Aug-2026 Anthropic list prices, overridable via `FOREMAN_PRICES`
   (JSON: `{"tier": [input, cache_write, cache_read, output]}` in $/Mtok). On a
   subscription the dollars are notional — proportions and savings are real.
-- The cold/warm split assumes the default 5-minute cache TTL (`TTL_S` in
-  source).
-- Context composition uses a chars/4 approximation; the reported *shares* are
+- The cold/warm split assumes the default 5-minute prompt-cache TTL (`TTL_S`
+  in source).
+- Context composition uses a chars/4 approximation; reported *shares* are
   robust to it, absolute token counts less so.
-- Reads `~/.claude*/projects/*/*.jsonl` only. No network calls, no telemetry.
+- foreman reads `~/.claude*/projects/*/*.jsonl` — the transcripts Claude Code
+  already writes — and writes snapshots to `~/.local/state/foreman/`. No
+  network calls, no telemetry, nothing leaves your machine.
+
+</details>
 
 ## License
 
-MIT
+[MIT](LICENSE)
