@@ -1,35 +1,24 @@
 #!/usr/bin/env python3
 """
-foreman — measure where your Claude Code tokens actually go, then prove your savings.
+foreman — measure where your Claude Code tokens actually go, then cut the part
+that matters.
 
-Reads the local session transcripts Claude Code already writes
-(~/.claude/projects/*/*.jsonl — no API calls, no telemetry, nothing leaves
-your machine) and decomposes real spend into the categories that matter:
+Reads the session transcripts Claude Code already writes locally
+(~/.claude*/projects/*/*.jsonl). No API calls, no telemetry, nothing leaves
+your machine. Zero dependencies, Python 3.9+.
 
-  - COLD cache writes  : full-context rewrites after an idle gap (> cache TTL)
-  - WARM cache writes  : per-iteration deltas inside a turn
-  - cache reads        : the resident context re-read on EVERY agentic iteration
-  - input/output       : what you'd naively think you pay for (usually <15%)
+Usage:
+  foreman audit    [--days 7] [--deep]     decompose real spend
+  foreman snapshot [--tag NAME]            freeze a baseline
+  foreman compare  [--tag NAME]            current window vs a baseline
+  foreman ls                               list saved snapshots
+  foreman hook install|uninstall|status    manage the context-sentinel hook
+  foreman update                           update foreman itself
+  foreman version
 
-Why: most "token saver" tools optimize output — typically <1% of real spend in
-agentic use. The dominant cost is resident_context x loop_iterations. Measure
-yours before believing anyone's 97% screenshot, including ours.
-
-Commands:
-  audit      [--days 7] [--deep]      decompose spend; --deep adds whale autopsy
-  snapshot   [--tag NAME]             save current metrics as a named baseline
-  compare    [--tag NAME]             current window vs a saved baseline
-  ls                                  list saved snapshots
-
-Multi-profile: every ~/.claude* directory containing projects/ is scanned
-(CLAUDE_CONFIG_DIR profiles included). Duplicate session ids across profiles
-(e.g. a copied profile) are deduped. Restrict with --profile DIR.
-
-Honest-comparison note: raw $/week tracks how much you worked, not how
-efficient you were. `compare` therefore leads with NORMALIZED metrics —
-$/user-turn, resident context per call — and only then shows totals.
-
-Zero dependencies. Python 3.9+.
+Why: most "token saver" tools optimize output — typically ~10% of real agentic
+spend. The dominant cost is resident_context x loop_iterations. Measure yours
+before believing anyone's 97% screenshot, including ours.
 """
 import argparse
 import datetime
@@ -37,9 +26,16 @@ import glob
 import json
 import os
 import re
+import shutil
 import statistics
+import subprocess
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
+
+__version__ = "0.2.0"
+
+FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
+SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
 
 # $/Mtok: (input, cache_write_5m, cache_read, output). Override via FOREMAN_PRICES
 # (JSON, same shape) when prices change — these are Aug 2026 Anthropic list prices.
@@ -56,6 +52,8 @@ STATE_DIR = os.path.expanduser(os.environ.get("FOREMAN_STATE", "~/.local/state/f
 SYS_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 
+# ───────────────────────────── shared helpers ──────────────────────────────
+
 def tier(model):
     m = (model or "").lower()
     for k in PRICES:
@@ -71,14 +69,18 @@ def parse_ts(s):
         return None
 
 
-def discover_profiles(explicit):
+def discover_profiles(explicit=None):
+    """Claude Code config dirs: ~/.claude plus any CLAUDE_CONFIG_DIR-style
+    ~/.claude-* profile that has session data or settings."""
     if explicit:
         return [os.path.expanduser(explicit)]
     home = os.path.expanduser("~")
     outs = []
     for d in sorted(glob.glob(os.path.join(home, ".claude*"))):
-        if os.path.isdir(os.path.join(d, "projects")):
-            outs.append(d)
+        if os.path.isdir(os.path.join(d, "projects")) or \
+           os.path.isfile(os.path.join(d, "settings.json")):
+            if os.path.isdir(d):
+                outs.append(d)
     return outs or [os.path.join(home, ".claude")]
 
 
@@ -102,6 +104,8 @@ def iter_transcripts(profiles, cutoff):
             yield f, os.path.basename(os.path.dirname(f))
 
 
+# ───────────────────────────── audit machinery ─────────────────────────────
+
 def collect(profiles, days):
     """Single pass over transcripts -> aggregate metrics dict."""
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
@@ -112,15 +116,15 @@ def collect(profiles, days):
         "sessions": 0,
         "api_calls": 0,
         "wakes": 0,  # first call of a session, or any call after gap > TTL
-        "tok": Counter(),  # input/cw_cold/cw_warm/cr/output
-        "cost": Counter(),  # same keys, dollars
+        "tok": Counter(),
+        "cost": Counter(),
         "cost_by_model": Counter(),
         "cost_by_project": Counter(),
         "gap_buckets": Counter(),
-        "ctx_per_call": [],  # sampled context sizes (input+cr+cw)
-        "wake_rewrite": [],  # cw on cold calls = resident rewritten
-        "first_ctx": [],  # initial context of fresh sessions (fixed prefix floor)
-        "whales": [],  # (cost, calls, max_ctx, project, path)
+        "ctx_per_call": [],
+        "wake_rewrite": [],
+        "first_ctx": [],
+        "whales": [],
     }
     for f, proj in iter_transcripts(profiles, cutoff):
         s_cost = 0.0
@@ -206,7 +210,6 @@ def collect(profiles, days):
 
 
 def summarize(m):
-    """Reduce collected metrics to the flat dict snapshots store and compare uses."""
     total = sum(m["cost"].values())
     ctx = m["ctx_per_call"]
     wr = m["wake_rewrite"]
@@ -268,7 +271,7 @@ def print_audit(m, deep=False):
         print("\nWHALE AUTOPSY (composition of the biggest sessions' content)")
         for c, n, mx, proj, path in m["whales"][:5]:
             comp = autopsy(path)
-            tot = sum(v for k, v in comp.items() if k != "thinking") or 1
+            tot = sum(v for k, v in comp.items() if k not in ("thinking", "stale_pct")) or 1
             print(f"  {proj[:38]:38} tool_traffic {(comp['tool_results'] + comp['tool_inputs']) * 100 // tot}% "
                   f"(results {comp['tool_results'] * 100 // tot}% / inputs {comp['tool_inputs'] * 100 // tot}%) · "
                   f"dialogue {(comp['assistant_text'] + comp['user_text']) * 100 // tot}% · "
@@ -322,6 +325,8 @@ def autopsy(path):
     return cat
 
 
+# ─────────────────────────── snapshot / compare ────────────────────────────
+
 def cmd_snapshot(m, tag):
     os.makedirs(STATE_DIR, exist_ok=True)
     path = os.path.join(STATE_DIR, f"{tag}.json")
@@ -333,7 +338,7 @@ def cmd_snapshot(m, tag):
 def cmd_compare(m, tag):
     path = os.path.join(STATE_DIR, f"{tag}.json")
     if not os.path.exists(path):
-        sys.exit(f"no snapshot '{tag}' — run: foreman.py snapshot --tag {tag}")
+        sys.exit(f"no snapshot '{tag}' — run: foreman snapshot --tag {tag}")
     base = json.load(open(path))
     cur = summarize(m)
 
@@ -363,34 +368,137 @@ def cmd_compare(m, tag):
     print("normalized block, ideally over comparable workloads.")
 
 
-def main():
-    ap = argparse.ArgumentParser(prog="foreman.py", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["audit", "snapshot", "compare", "ls"])
-    ap.add_argument("--days", type=int, default=7)
-    ap.add_argument("--profile", help="scan only this config dir (default: every ~/.claude*)")
-    ap.add_argument("--tag", default="baseline")
-    ap.add_argument("--deep", action="store_true", help="audit: add whale composition autopsy")
-    a = ap.parse_args()
-
-    if a.cmd == "ls":
-        os.makedirs(STATE_DIR, exist_ok=True)
-        for f in sorted(glob.glob(os.path.join(STATE_DIR, "*.json"))):
-            d = json.load(open(f))
-            print(f"  {os.path.basename(f)[:-5]:20} {d['generated'][:16]}  "
-                  f"{fmt_money(d['total_cost'])} / {d['window_days']}d  "
-                  f"$/turn {d['cost_per_wake']:.2f}")
+def cmd_ls():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    snaps = sorted(glob.glob(os.path.join(STATE_DIR, "*.json")))
+    if not snaps:
+        print("no snapshots yet — run: foreman snapshot")
         return
+    for f in snaps:
+        d = json.load(open(f))
+        print(f"  {os.path.basename(f)[:-5]:24} {d['generated'][:16]}  "
+              f"{fmt_money(d['total_cost'])} / {d['window_days']}d  "
+              f"$/turn {d['cost_per_wake']:.2f}")
 
-    profiles = discover_profiles(a.profile)
-    m = collect(profiles, a.days)
-    if a.cmd == "audit":
-        print_audit(m, deep=a.deep)
-    elif a.cmd == "snapshot":
-        cmd_snapshot(m, a.tag)
-        print_audit(m)
-    elif a.cmd == "compare":
-        cmd_compare(m, a.tag)
+
+# ────────────────────────────── hook manager ───────────────────────────────
+
+def _hook_command(mode):
+    cmd = f"python3 {SENTINEL}"
+    if mode and mode != "advise":
+        cmd = f"FOREMAN_MODE={mode} {cmd}"
+    return cmd
+
+
+def _load_settings(prof):
+    p = os.path.join(prof, "settings.json")
+    if os.path.exists(p):
+        return p, json.load(open(p))
+    return p, {}
+
+
+def cmd_hook(action, profile=None, mode="advise"):
+    profiles = discover_profiles(profile)
+    stamp = datetime.date.today().isoformat()
+    for prof in profiles:
+        p, d = _load_settings(prof)
+        groups = d.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
+        installed = [
+            (g, h) for g in groups for h in g.get("hooks", [])
+            if "context_sentinel.py" in h.get("command", "")
+        ]
+        name = prof.replace(os.path.expanduser("~"), "~")
+        if action == "status":
+            if installed:
+                print(f"  {name:24} ✓ installed  ({installed[0][1]['command']})")
+            else:
+                print(f"  {name:24} — not installed")
+            continue
+        if action == "install":
+            if not os.path.exists(SENTINEL):
+                sys.exit(f"sentinel not found at {SENTINEL}")
+            if installed:
+                installed[0][1]["command"] = _hook_command(mode)
+                print(f"  {name:24} ✓ updated")
+            else:
+                groups.append({"hooks": [{"type": "command", "command": _hook_command(mode)}]})
+                print(f"  {name:24} ✓ installed")
+        elif action == "uninstall":
+            if not installed:
+                print(f"  {name:24} — nothing to remove")
+                continue
+            for g, h in installed:
+                g["hooks"].remove(h)
+            d["hooks"]["UserPromptSubmit"] = [g for g in groups if g.get("hooks")]
+            if not d["hooks"]["UserPromptSubmit"]:
+                del d["hooks"]["UserPromptSubmit"]
+            print(f"  {name:24} ✓ removed")
+        if os.path.exists(p):
+            shutil.copy2(p, p + f".bak.foreman-{stamp}")
+        os.makedirs(prof, exist_ok=True)
+        json.dump(d, open(p, "w"), indent=2)
+        json.load(open(p))  # sanity: still valid JSON
+    if action != "status":
+        print("\nNote: running sessions capture hooks at startup — restart long-lived")
+        print("sessions once for the sentinel to take effect there.")
+
+
+# ──────────────────────────────── update ───────────────────────────────────
+
+def cmd_update():
+    if os.path.isdir(os.path.join(FOREMAN_HOME, ".git")) and shutil.which("git"):
+        r = subprocess.run(["git", "-C", FOREMAN_HOME, "pull", "--ff-only"],
+                           capture_output=True, text=True)
+        print(r.stdout.strip() or r.stderr.strip())
+    else:
+        print("not a git install — re-run the installer:\n"
+              "  curl -fsSL https://raw.githubusercontent.com/vikgmdev/foreman/main/install.sh | bash")
+
+
+# ───────────────────────────────── main ────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="foreman", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    for name in ("audit", "snapshot", "compare"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--days", type=int, default=7)
+        sp.add_argument("--profile", help="scan only this config dir (default: every ~/.claude*)")
+        sp.add_argument("--tag", default="baseline")
+        if name == "audit":
+            sp.add_argument("--deep", action="store_true", help="add whale composition autopsy")
+    sub.add_parser("ls")
+    hp = sub.add_parser("hook")
+    hp.add_argument("action", choices=["install", "uninstall", "status"])
+    hp.add_argument("--profile", help="target one config dir (default: every ~/.claude*)")
+    hp.add_argument("--mode", choices=["advise", "block"], default="advise")
+    sub.add_parser("update")
+    sub.add_parser("version")
+
+    a = ap.parse_args()
+    if not a.cmd:
+        ap.print_help()
+        return
+    if a.cmd == "version":
+        print(f"foreman {__version__}")
+    elif a.cmd == "ls":
+        cmd_ls()
+    elif a.cmd == "hook":
+        cmd_hook(a.action, a.profile, a.mode)
+    elif a.cmd == "update":
+        cmd_update()
+    else:
+        m = collect(discover_profiles(a.profile), a.days)
+        if a.cmd == "audit":
+            print_audit(m, deep=a.deep)
+        elif a.cmd == "snapshot":
+            cmd_snapshot(m, a.tag)
+            print_audit(m)
+        elif a.cmd == "compare":
+            cmd_compare(m, a.tag)
 
 
 if __name__ == "__main__":
