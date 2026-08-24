@@ -34,7 +34,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -686,7 +686,7 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         subprocess.run(["tmux", "send-keys", "-t", pane, resume, "Enter"])
         print(f"  ✓ relaunched: {resume}")
     if manual:
-        print(f"\n{len(manual)} non-tmux session(s) still need /hooks or a manual resume (see dry-run).")
+        print(f"\n{len(manual)} session(s) (shared-cwd or non-tmux) still need /hooks inside, or a manual resume — run without --go for the recipes.")
 
 
 
