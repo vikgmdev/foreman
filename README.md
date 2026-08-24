@@ -1,17 +1,21 @@
-# 🐑 fleece
+# 👷 foreman
 
-**Stop getting fleeced by your own sessions.**
+**Your Claude Code sessions have no supervisor. Now they do.**
 
-Long-running Claude Code sessions never stop growing wool. Measured on a real
-multi-project setup, the **top-10 longest sessions were 66% of all spend**, each
-dragging ~1M tokens of context — and **75–80% of it was fleece**: old command
-outputs, old file reads, edit payloads applied hundreds of turns ago. Dead
-weight, re-read and re-billed on *every single agentic iteration*.
+A foreman's job is simple: make sure the work finishes **on time and within
+budget**, and that nobody leaves the job site buried in debris. Long-running
+Claude Code sessions fail both without one. Measured on a real multi-project
+setup, the **top-10 longest sessions were 66% of all spend**, each dragging ~1M
+tokens of context — and **75–80% of it was debris**: old command outputs, old
+file reads, edit payloads applied hundreds of turns ago. Re-read, and re-billed,
+on *every single agentic iteration*.
 
-fleece measures your real spend from the transcripts Claude Code already writes
-on your disk, shows you exactly how much wool your sessions are carrying, and
-shears it at the one moment shearing is free. Nothing leaves your machine. Zero
-dependencies. And it will tell you honestly if your setup doesn't need it.
+foreman walks your job site (the transcripts Claude Code already writes on your
+disk), shows you exactly where the budget goes, and orders a cleanup at the one
+moment cleanup is free. Nothing leaves your machine. Zero dependencies. And it
+will tell you honestly if your site is already clean.
+
+*(Yes, there's a 2011 Ruby process manager named foreman. Different job site.)*
 
 ## Why the viral "97% saved" screenshots miss
 
@@ -27,56 +31,56 @@ spend. Decomposing actual usage:
 | uncached input | 0.1% | |
 
 The bill is governed by one product: **`resident_context × loop_iterations`**.
-In long sessions, resident context is mostly wool — the *dialogue*, where your
-decisions actually live, is only ~20%. Shearing the dead part shrinks a 1M
-session to ~250K **without touching the conversation**. Honest expected savings
-for long-running multi-project workflows: **50–70%**. Not 97%. Nobody's is 97%.
+In long sessions, resident context is mostly debris — the *dialogue*, where your
+decisions actually live, is only ~20%. Clearing the debris shrinks a 1M session
+to ~250K **without touching the conversation**. Honest expected savings for
+long-running multi-project workflows: **50–70%**. Not 97%. Nobody's is 97%.
 
-## The trick: sheep get shorn while they rest
+## The rule: clean the site while the crew is off
 
 The prompt cache lives ~5 minutes. If you run many sessions and touch each one
 occasionally, nearly every message you send lands on a **cold cache** — the
 full-context rewrite happens anyway, whatever you do. Which means:
 
-> **Right after a long idle, shearing is free.** The expensive rewrite was
-> already going to happen. Shear then, and every iteration afterwards runs on a
+> **Right after a long idle, cleanup is free.** The expensive rewrite was
+> already going to happen. Clean then, and every iteration afterwards runs on a
 > fraction of the context.
 
 This also kills auto-compact's classic failure mode — firing mid-task and
 destroying the plan you were in the middle of. A session that has been idle for
-an hour is, by definition, between things.
+an hour is, by definition, between shifts.
 
 ## Usage
 
 ```bash
-# 1. Weigh the wool (multi-profile aware; dedupes cloned profiles)
-python3 fleece.py audit --deep
+# 1. Walk the site (multi-profile aware; dedupes cloned profiles)
+python3 foreman.py audit --deep
 
 # 2. Freeze the "before" — this is what makes your savings claim publishable
-python3 fleece.py snapshot --tag baseline
+python3 foreman.py snapshot --tag baseline
 
-# 3. Install the shears (below), work normally for a few days…
+# 3. Put the foreman on duty (below), work normally for a few days…
 
 # 4. …then prove it — or disprove it
-python3 fleece.py compare --tag baseline
+python3 foreman.py compare --tag baseline
 ```
 
 `compare` leads with **normalized metrics** — $ per user-turn, resident context
 per call — because raw weekly totals track how much you worked, not how efficient
 you got. Claim savings from the normalized block only.
 
-## The shears
+## On duty
 
-`hooks/context_sentinel.py` is a `UserPromptSubmit` hook implementing the
-shorn-while-resting rule: when you message a session that is **woolly** (>150K
-resident) *and* **cold** (idle >1h), it intervenes:
+`hooks/context_sentinel.py` is a `UserPromptSubmit` hook enforcing the
+clean-site rule: when you message a session that is **cluttered** (>150K
+resident) *and* **cold** (idle >1h), the foreman steps in:
 
-- `FLEECE_MODE=advise` (default) — tells the model to shear surgically first:
-  *keep the last 15 turns and every decision/state verbatim; drop stale tool
-  traffic (durable facts already live in files/memory)*.
-- `FLEECE_MODE=block` — bounces your prompt back with the exact `/compact`
+- `FOREMAN_MODE=advise` (default) — tells the model to clean up first,
+  surgically: *keep the last 15 turns and every decision/state verbatim; drop
+  stale tool traffic (durable facts already live in files/memory)*.
+- `FOREMAN_MODE=block` — bounces your prompt back with the exact `/compact`
   command; nothing happens without you.
-- `FLEECE_MODE=off` — disabled.
+- `FOREMAN_MODE=off` — off duty.
 
 Install — add to `~/.claude/settings.json` (any profile):
 
@@ -85,14 +89,14 @@ Install — add to `~/.claude/settings.json` (any profile):
   "hooks": {
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command",
-          "command": "python3 /ABSOLUTE/PATH/fleece/hooks/context_sentinel.py" } ] }
+          "command": "python3 /ABSOLUTE/PATH/foreman/hooks/context_sentinel.py" } ] }
     ]
   }
 }
 ```
 
-Thresholds: `FLEECE_CTX_TOKENS` (150000), `FLEECE_IDLE_S` (3600). The hook fails
-open — any error and your prompt proceeds untouched.
+Thresholds: `FOREMAN_CTX_TOKENS` (150000), `FOREMAN_IDLE_S` (3600). The hook
+fails open — any error and your prompt proceeds untouched.
 
 ## What else actually moves the bill (measured, in order)
 
@@ -113,7 +117,7 @@ open — any error and your prompt proceeds untouched.
 
 ## Method notes
 
-- Prices: Aug-2026 Anthropic list, overridable via `FLEECE_PRICES`. On a
+- Prices: Aug-2026 Anthropic list, overridable via `FOREMAN_PRICES`. On a
   subscription the dollars are notional — the proportions and savings are real.
 - Cold/warm split assumes the default 5-minute cache TTL (`TTL_S` in source).
 - Composition uses a chars/4 approximation; shares are robust to it.

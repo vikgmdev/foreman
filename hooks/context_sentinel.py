@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fleece context sentinel — a UserPromptSubmit hook for Claude Code.
+foreman context sentinel — a UserPromptSubmit hook for Claude Code.
 
 THE INSIGHT THIS AUTOMATES: after an idle gap longer than the prompt-cache TTL
 (5 min), your next message pays a full-context rewrite ANYWAY — the cache is
@@ -10,8 +10,8 @@ after it runs on a fraction of the context. Long-running, mostly-idle sessions
 (the multi-project tmux pattern) hit this constantly.
 
 WHAT IT DOES: when you submit a prompt to a session whose resident context
-exceeds FLEECE_CTX_TOKENS *and* that has been idle longer than FLEECE_IDLE_S,
-it intervenes, in one of two modes (FLEECE_MODE):
+exceeds FOREMAN_CTX_TOKENS *and* that has been idle longer than FOREMAN_IDLE_S,
+it intervenes, in one of two modes (FOREMAN_MODE):
 
   advise (default) : injects context telling the model to surgically compact
                      first (keep the dialogue and recent turns; drop stale tool
@@ -21,13 +21,13 @@ it intervenes, in one of two modes (FLEECE_MODE):
                      run first. Zero-trust mode: nothing happens automatically.
 
 Config (env, all optional):
-  FLEECE_CTX_TOKENS  resident-context threshold (default 150000)
-  FLEECE_IDLE_S      idle threshold in seconds  (default 3600)
-  FLEECE_MODE        advise | block | off       (default advise)
+  FOREMAN_CTX_TOKENS  resident-context threshold (default 150000)
+  FOREMAN_IDLE_S      idle threshold in seconds  (default 3600)
+  FOREMAN_MODE        advise | block | off       (default advise)
 
 Install (~/.claude/settings.json):
   "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command",
-    "command": "python3 /path/to/fleece/hooks/context_sentinel.py" } ] } ] }
+    "command": "python3 /path/to/foreman/hooks/context_sentinel.py" } ] } ] }
 
 Stdlib only. Fails open: any error -> exit 0, prompt proceeds untouched.
 """
@@ -36,9 +36,9 @@ import json
 import os
 import sys
 
-CTX_THRESHOLD = int(os.environ.get("FLEECE_CTX_TOKENS", "150000"))
-IDLE_S = int(os.environ.get("FLEECE_IDLE_S", "3600"))
-MODE = os.environ.get("FLEECE_MODE", "advise").lower()
+CTX_THRESHOLD = int(os.environ.get("FOREMAN_CTX_TOKENS", "150000"))
+IDLE_S = int(os.environ.get("FOREMAN_IDLE_S", "3600"))
+MODE = os.environ.get("FOREMAN_MODE", "advise").lower()
 
 SURGICAL = (
     "keep the last 15 turns verbatim and every decision, open task, file path and "
@@ -104,12 +104,12 @@ def main():
         print(json.dumps({
             "decision": "block",
             "reason": (
-                f"[fleece] This session holds ~{ctx_k}K tokens of context and has been idle "
+                f"[foreman] This session holds ~{ctx_k}K tokens of context and has been idle "
                 f"{idle_h:.1f}h — the prompt cache is cold, so compacting RIGHT NOW is free "
                 f"(the full rewrite was going to happen anyway). Run:\n\n"
                 f"  /compact {SURGICAL}\n\n"
                 f"…or /clear if you are between tasks. Then resend your message. "
-                f"(Disable with FLEECE_MODE=off)"
+                f"(Disable with FOREMAN_MODE=off)"
             ),
         }))
         return
@@ -118,7 +118,7 @@ def main():
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": (
-                f"[fleece] Resident context is ~{ctx_k}K tokens and this session was "
+                f"[foreman] Resident context is ~{ctx_k}K tokens and this session was "
                 f"idle {idle_h:.1f}h (cache cold — compaction at this moment costs nothing extra; "
                 f"in measured long sessions 75-80% of context is tool traffic, ~99% of it stale). "
                 f"Before addressing the user's request: if a SlashCommand tool is available, run "
