@@ -14,6 +14,7 @@ Usage:
   foreman ls                               list saved snapshots
   foreman hook install|uninstall|status    manage the context-sentinel hook
   foreman restart [--go]                   recycle idle tmux sessions in place
+  foreman session <id|project>             one session's card: context, cost, compactions
   foreman update                           update foreman itself
   foreman version
 
@@ -33,7 +34,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.3.3"
+__version__ = "0.4.0"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -658,6 +659,102 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         print(f"\n{len(manual)} non-tmux session(s) still need /hooks or a manual resume (see dry-run).")
 
 
+
+
+# ──────────────────────────── single-session card ──────────────────────────
+
+def _find_transcripts(match):
+    hits = []
+    for prof in discover_profiles():
+        for f in glob.glob(os.path.join(prof, "projects", "*", "*.jsonl")):
+            if (match in os.path.basename(f) or match in os.path.basename(os.path.dirname(f))
+                    or match == f):
+                hits.append((os.path.getmtime(f), f, prof))
+    return sorted(hits, reverse=True)
+
+
+def cmd_session(match):
+    hits = _find_transcripts(match)
+    if not hits:
+        sys.exit(f"no session matches '{match}' (try a session-id prefix or a project-dir substring)")
+    if len(hits) > 1:
+        print(f"{len(hits)} sessions match '{match}' — newest first; narrow with a session-id prefix:")
+        for mt, f, prof in hits[:8]:
+            age = (time.time() - mt) / 60
+            print(f"  {os.path.basename(f)[:12]}…  {age:7.0f}m idle  {os.path.basename(os.path.dirname(f))}")
+        if len(hits) > 8:
+            print(f"  … and {len(hits) - 8} more")
+        return
+    _, path, prof = hits[0]
+
+    calls = 0
+    cost = 0.0
+    ctx_now = 0
+    ctx_max = 0
+    first_ts = last_ts = None
+    last_tier = "opus"
+    drops = []
+    prev_ctx = 0
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            if '"usage"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            msg = d.get("message") or {}
+            u = msg.get("usage") or {}
+            if not u:
+                continue
+            i = u.get("input_tokens", 0) or 0
+            cw = u.get("cache_creation_input_tokens", 0) or 0
+            cr = u.get("cache_read_input_tokens", 0) or 0
+            o = u.get("output_tokens", 0) or 0
+            if i + cw + cr + o == 0:
+                continue
+            last_tier = tier(msg.get("model"))
+            pi, pw, pr, po = PRICES[last_tier]
+            cost += (i * pi + cw * pw + cr * pr + o * po) / 1e6
+            ctx = i + cw + cr
+            calls += 1
+            ts = d.get("timestamp")
+            if ts:
+                first_ts = first_ts or ts
+                last_ts = ts
+            # a compaction / clear shows up as a sharp resident-context drop
+            if prev_ctx > 50_000 and ctx < prev_ctx * 0.7:
+                drops.append((ts or "?", prev_ctx, ctx))
+            if ctx:
+                prev_ctx = ctx
+            ctx_now = ctx or ctx_now
+            ctx_max = max(ctx_max, ctx)
+
+    comp = autopsy(path)
+    ctot = sum(v for k, v in comp.items() if k not in ("thinking", "stale_pct")) or 1
+    tool_pct = (comp["tool_results"] + comp["tool_inputs"]) * 100 // ctot
+    dia_pct = (comp["assistant_text"] + comp["user_text"]) * 100 // ctot
+    pi, pw, pr, po = PRICES[last_tier]
+    idle_m = (time.time() - os.path.getmtime(path)) / 60
+
+    print(f"session  {os.path.basename(path)[:-6]}")
+    print(f"project  {os.path.basename(os.path.dirname(path))}   profile {os.path.basename(prof)}")
+    print(f"activity {calls:,} calls · first {str(first_ts)[:16]} · last {str(last_ts)[:16]} · idle {idle_m:.0f}m")
+    print(f"cost     {fmt_money(cost)} total (est., {last_tier})")
+    print(f"context  now {ctx_now / 1000:,.0f}K · peak {ctx_max / 1000:,.0f}K")
+    print(f"content  tool traffic {tool_pct}% (stale {comp['stale_pct']}%) · dialogue {dia_pct}%")
+    print(f"forward  next cold wake rewrite ≈ {fmt_money(ctx_now * pw / 1e6)} · "
+          f"each warm iteration reads ≈ {fmt_money(ctx_now * pr / 1e6)}")
+    if drops:
+        print("\ncontext reductions detected (compaction / clear events):")
+        for ts, a, b in drops[-5:]:
+            saved_read = (a - b) * pr / 1e6
+            print(f"  {str(ts)[:16]}  {a / 1000:,.0f}K → {b / 1000:,.0f}K   "
+                  f"(−{(a - b) / 1000:,.0f}K · each later iteration ≈ {fmt_money(saved_read)} cheaper)")
+    else:
+        print("\nno compaction events detected in this transcript yet.")
+
+
 # ──────────────────────────────── update ───────────────────────────────────
 
 def cmd_update():
@@ -697,6 +794,8 @@ def main():
     rp.add_argument("--target", help="filter: pid, tmux pane/session, or cwd substring")
     rp.add_argument("--force", action="store_true",
                     help="ignore the idle check (NOT recommended)")
+    sp = sub.add_parser("session")
+    sp.add_argument("match", help="session-id prefix, project-dir substring, or transcript path")
     sub.add_parser("update")
     sub.add_parser("version")
 
@@ -710,6 +809,8 @@ def main():
         cmd_ls()
     elif a.cmd == "hook":
         cmd_hook(a.action, a.profile, a.mode)
+    elif a.cmd == "session":
+        cmd_session(a.match)
     elif a.cmd == "restart":
         cmd_restart(a.idle_min, a.go, a.target, a.force)
     elif a.cmd == "update":
