@@ -34,7 +34,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -659,6 +659,13 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
             print("\nrun with --go to recycle the tmux ones in place.")
         return
 
+    if not auto:
+        print(f"\nnothing ready to recycle right now — every candidate is busy "
+              f"(idle < {idle_min}m), shared-cwd, remote-control or defunct.")
+        print(f"re-run when sessions have settled, or lower the bar: "
+              f"foreman restart --go --idle-min 15")
+        return
+    print(f"\nrecycling {len(auto)} session(s) …")
     for r in auto:
         pane, sess = r["pane"]
         print(f"\nrecycling {pane} ({sess}) ...")
