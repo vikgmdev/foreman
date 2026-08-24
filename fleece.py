@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-barber — measure where your Claude Code tokens actually go, then prove your savings.
+fleece — measure where your Claude Code tokens actually go, then prove your savings.
 
 Reads the local session transcripts Claude Code already writes
 (~/.claude/projects/*/*.jsonl — no API calls, no telemetry, nothing leaves
@@ -41,18 +41,18 @@ import statistics
 import sys
 from collections import Counter, defaultdict
 
-# $/Mtok: (input, cache_write_5m, cache_read, output). Override via BARBER_PRICES
+# $/Mtok: (input, cache_write_5m, cache_read, output). Override via FLEECE_PRICES
 # (JSON, same shape) when prices change — these are Aug 2026 Anthropic list prices.
 PRICES = {
     "opus": (15.0, 18.75, 1.5, 75.0),
     "sonnet": (3.0, 3.75, 0.3, 15.0),
     "haiku": (0.8, 1.0, 0.08, 4.0),
 }
-if os.environ.get("BARBER_PRICES"):
-    PRICES.update({k: tuple(v) for k, v in json.loads(os.environ["BARBER_PRICES"]).items()})
+if os.environ.get("FLEECE_PRICES"):
+    PRICES.update({k: tuple(v) for k, v in json.loads(os.environ["FLEECE_PRICES"]).items()})
 
 TTL_S = 300  # 5-minute default prompt-cache TTL; gaps beyond this = cold wake
-STATE_DIR = os.path.expanduser(os.environ.get("BARBER_STATE", "~/.local/state/barber"))
+STATE_DIR = os.path.expanduser(os.environ.get("FLEECE_STATE", "~/.local/state/fleece"))
 SYS_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 
@@ -239,7 +239,7 @@ def fmt_money(v):
 def print_audit(m, deep=False):
     s = summarize(m)
     total = s["total_cost"]
-    print(f"barber audit — last {m['window_days']}d across {len(m['profiles'])} profile(s)")
+    print(f"fleece audit — last {m['window_days']}d across {len(m['profiles'])} profile(s)")
     print(f"  {s['sessions']} sessions · {s['api_calls']:,} API calls · {s['wakes']:,} cold wakes\n")
     print("WHERE THE MONEY GOES (est. list prices; subscriptions burn the same budget)")
     rows = [
@@ -333,7 +333,7 @@ def cmd_snapshot(m, tag):
 def cmd_compare(m, tag):
     path = os.path.join(STATE_DIR, f"{tag}.json")
     if not os.path.exists(path):
-        sys.exit(f"no snapshot '{tag}' — run: barber.py snapshot --tag {tag}")
+        sys.exit(f"no snapshot '{tag}' — run: fleece.py snapshot --tag {tag}")
     base = json.load(open(path))
     cur = summarize(m)
 
@@ -346,7 +346,7 @@ def cmd_compare(m, tag):
         mark = "✅" if good and abs(delta) >= 3 else ("⚠️" if abs(delta) >= 3 else "· ")
         print(f"  {mark} {label:34} {b:>12,.2f}{unit} -> {c:>12,.2f}{unit}   {delta:+6.1f}%")
 
-    print(f"barber compare — '{tag}' ({base['generated'][:10]}) vs now, {cur['window_days']}d windows")
+    print(f"fleece compare — '{tag}' ({base['generated'][:10]}) vs now, {cur['window_days']}d windows")
     print("\nNORMALIZED (workload-independent — these are the honest ones)")
     row("$ per user-turn (cold wake)", "cost_per_wake")
     row("$ per API call", "cost_per_call")
@@ -364,7 +364,7 @@ def cmd_compare(m, tag):
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="barber.py", description=__doc__,
+    ap = argparse.ArgumentParser(prog="fleece.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["audit", "snapshot", "compare", "ls"])
     ap.add_argument("--days", type=int, default=7)
