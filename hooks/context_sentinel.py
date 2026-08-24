@@ -84,8 +84,22 @@ def last_state(transcript_path):
     return ctx, idle
 
 
+def _log(msg):
+    """Best-effort execution trace — the proof the sentinel ran in a session,
+    fired or not. ~/.local/state/foreman/sentinel.log, never fails the hook."""
+    try:
+        d = os.path.expanduser(os.environ.get("FOREMAN_STATE", "~/.local/state/foreman"))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "sentinel.log"), "a") as f:
+            ts = datetime.datetime.now().isoformat(timespec="seconds")
+            f.write(f"{ts} {msg}\n")
+    except Exception:
+        pass
+
+
 def main():
     if MODE == "off":
+        _log("mode=off")
         return
     try:
         payload = json.load(sys.stdin)
@@ -93,10 +107,14 @@ def main():
         return
     transcript = payload.get("transcript_path") or ""
     if not transcript or not os.path.exists(transcript):
+        _log("no-transcript")
         return
+    sid = os.path.basename(transcript)[:8]
     ctx, idle = last_state(transcript)
     if ctx < CTX_THRESHOLD or idle < IDLE_S:
+        _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> pass (thresholds {CTX_THRESHOLD // 1000}K/{IDLE_S // 60}m)")
         return
+    _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> FIRE mode={MODE}")
 
     ctx_k = ctx // 1000
     idle_h = idle / 3600
