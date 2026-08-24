@@ -32,7 +32,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -77,6 +77,8 @@ def discover_profiles(explicit=None):
     home = os.path.expanduser("~")
     outs = []
     for d in sorted(glob.glob(os.path.join(home, ".claude*"))):
+        if ".bak" in os.path.basename(d):
+            continue  # backup copies of a profile are not live profiles
         if os.path.isdir(os.path.join(d, "projects")) or \
            os.path.isfile(os.path.join(d, "settings.json")):
             if os.path.isdir(d):
