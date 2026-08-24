@@ -16,6 +16,8 @@ Usage:
   foreman restart [--go]                   recycle idle tmux sessions in place
   foreman session <id|project>             one session's card: context, cost, compactions
   foreman savings                          $ actually saved by sentinel-triggered compactions
+  foreman watch [--go]                     sweep: compact calm idle tmux sessions, trim dead fat transcripts
+  foreman watch --install                  run that sweep every 15 min (systemd user timer / cron)
   foreman update                           update foreman itself
   foreman version
 
@@ -35,7 +37,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1049,6 +1051,278 @@ def cmd_savings():
     print("   it grows every time those sessions keep working. Re-run anytime.)")
 
 
+# ──────────────────────────────── watch ────────────────────────────────────
+# The two arms of proactive cleanup, from the design discussion:
+#   LIVE sessions — context lives in the process's memory; the only way in is
+#     in-band: type the surgical /compact into its pane. watch does that for
+#     fat sessions whose pane is verifiably calm and whose transcript is idle,
+#     reusing the sentinel's deferred-compact watcher (same calm gate, same
+#     in-flight marker, same log).
+#   DEAD sessions — on --resume Claude Code rebuilds context from the .jsonl,
+#     so the transcript can be trimmed surgically on disk: blank the payload
+#     of stale tool_result blocks (and Claude Code's duplicate toolUseResult
+#     field) while keeping every uuid, pairing and dialogue line intact. No
+#     LLM, no summary, deterministic. The cache is long dead (idle > TTL), so
+#     the cold write on next resume happens anyway — just over a far smaller
+#     context.
+# Golden rule inherited from restart: don't guess. Any file that doesn't parse
+# cleanly line-by-line is left alone; a backup (.jsonl.foreman-bak) always
+# precedes a rewrite; live project dirs are never trimmed.
+
+TRIM_MARK = "[trimmed by foreman]"
+TRIM_MIN_BLOCK = 200        # don't bother blanking payloads smaller than this
+TRIM_MIN_TOTAL = 200_000    # chars (~50K tokens): below this a file isn't worth it
+
+
+def _slog(msg):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "sentinel.log"), "a") as f:
+            ts = datetime.datetime.now().isoformat(timespec="seconds")
+            f.write(f"{ts} {msg}\n")
+    except Exception:
+        pass
+
+
+def _last_ctx_tail(path, tail_bytes=4_000_000):
+    """Resident context from the tail of a transcript (fast on 50MB whales;
+    the first partial line just fails json.loads and is skipped)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+            data = f.read().decode(errors="ignore")
+    except OSError:
+        return 0
+    ctx = 0
+    for line in data.splitlines():
+        if '"usage"' not in line:
+            continue
+        try:
+            u = (json.loads(line).get("message") or {}).get("usage") or {}
+        except Exception:
+            continue
+        c = (u.get("input_tokens", 0) or 0) + \
+            (u.get("cache_read_input_tokens", 0) or 0) + \
+            (u.get("cache_creation_input_tokens", 0) or 0)
+        if c:
+            ctx = c
+    return ctx
+
+
+def _is_user_turn(d):
+    """A real human prompt line — the unit the keep-window is counted in."""
+    if d.get("type") != "user" or d.get("isMeta") or "toolUseResult" in d:
+        return False
+    c = (d.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return bool(c.strip())
+    if isinstance(c, list):
+        return any(isinstance(b, dict) and b.get("type") == "text" for b in c)
+    return False
+
+
+def trim_transcript(path, keep_turns=15, go=False):
+    """Blank stale tool payloads in a DEAD session's transcript. Returns
+    (chars_shed, context_chars_shed, blocks, reason) — reason set when skipped;
+    context_chars_shed counts only tool_result payloads (what resume replays)."""
+    try:
+        raw = open(path, errors="strict").read().splitlines(True)
+    except (OSError, UnicodeDecodeError) as e:
+        return 0, 0, 0, f"unreadable ({e.__class__.__name__})"
+    parsed = []
+    for ln in raw:
+        try:
+            parsed.append(json.loads(ln))
+        except Exception:
+            return 0, 0, 0, "line failed to parse — refusing to touch this file"
+    user_idx = [i for i, d in enumerate(parsed) if _is_user_turn(d)]
+    if len(user_idx) <= keep_turns:
+        return 0, 0, 0, f"only {len(user_idx)} user turns (keep window is {keep_turns})"
+    cut = user_idx[-keep_turns]
+    shed = shed_ctx = blocks = 0   # shed_ctx: tool_result payloads — the part
+    changed = {}                   # that gets replayed into context on resume
+    for i in range(cut):
+        d = parsed[i]
+        dirty = False
+        c = (d.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    s = json.dumps(b.get("content", ""))
+                    if len(s) > TRIM_MIN_BLOCK:
+                        b["content"] = f"{TRIM_MARK[:-1]}: {len(s)} chars]"
+                        shed += len(s)
+                        shed_ctx += len(s)
+                        blocks += 1
+                        dirty = True
+        if "toolUseResult" in d:   # Claude Code's duplicate copy — disk only
+            s = json.dumps(d["toolUseResult"])
+            if len(s) > TRIM_MIN_BLOCK:
+                d["toolUseResult"] = f"{TRIM_MARK[:-1]}: {len(s)} chars]"
+                shed += len(s)
+                dirty = True
+        if dirty:
+            changed[i] = d
+    if shed < TRIM_MIN_TOTAL:
+        return shed, shed_ctx, blocks, "not enough stale payload to be worth a rewrite"
+    if not go:
+        return shed, shed_ctx, blocks, None
+    out_lines = []
+    for i, ln in enumerate(raw):
+        if i in changed:
+            new = json.dumps(changed[i], ensure_ascii=False) + "\n"
+            json.loads(new)  # every rewritten line must round-trip
+            out_lines.append(new)
+        else:
+            out_lines.append(ln)
+    if len(out_lines) != len(raw):
+        return 0, 0, 0, "internal line-count mismatch — aborted"
+    tmp = path + ".foreman-tmp"
+    with open(tmp, "w") as f:
+        f.writelines(out_lines)
+    shutil.copy2(path, path + ".foreman-bak")   # backup BEFORE the swap
+    os.replace(tmp, path)
+    return shed, shed_ctx, blocks, None
+
+
+def _live_claude_procs(kids, info):
+    """(pid, profile, proj_dir, transcript, mtime) for every running claude."""
+    rows = []
+    for pid, (_ppid, _et, comm) in info.items():
+        if comm != "claude" or _is_ancestor(int(pid)):
+            continue
+        env = _proc_env(pid)
+        if not env:
+            continue
+        profile = env.get("CLAUDE_CONFIG_DIR", "") or os.path.expanduser("~/.claude")
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        proj = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+        files = glob.glob(os.path.join(profile, "projects", proj, "*.jsonl"))
+        f = max(files, key=os.path.getmtime) if files else None
+        rows.append((pid, profile, proj, f, os.path.getmtime(f) if f else 0))
+    return rows
+
+
+def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
+    now = time.time()
+    kids, info = _proc_table()
+    pane_of = _tmux_pane_index(kids)
+    live = _live_claude_procs(kids, info)
+    live_projects = {(p, j) for _, p, j, _, _ in live}
+    print(f"foreman watch — {'EXECUTING' if go else 'dry-run (--go to execute)'}"
+          f"  [fat ≥{ctx_min // 1000}K · idle ≥{idle_min}m · keep last {keep_turns} turns]")
+
+    # arm 1 — LIVE fat idle sessions in calm tmux panes: in-band /compact
+    n_compact = 0
+    procs_in = Counter((p, j) for _, p, j, _, _ in live)
+    for pid, profile, proj, f, mt in sorted(live, key=lambda r: -(r[4] or 0)):
+        if not f:
+            continue
+        sid = os.path.basename(f)[:8]
+        ctx = _last_ctx_tail(f)
+        idle = (now - mt) / 60
+        if ctx < ctx_min:
+            continue
+        pane, _sess = pane_of.get(pid, (None, None))
+        state = _pane_state(pane) if pane else "no-tmux"
+        marker = os.path.join(STATE_DIR, f"compacting-{sid}")
+        in_flight = os.path.exists(marker) and (now - os.path.getmtime(marker)) < 180
+        if procs_in[(profile, proj)] > 1:
+            # several sessions share this cwd — the pane↔transcript mapping is
+            # a guess, and foreman doesn't act on guesses (restart's rule)
+            verdict = "skip (shared cwd — pane↔session mapping ambiguous)"
+        elif idle < idle_min:
+            verdict = f"skip (idle {idle:.0f}m < {idle_min}m)"
+        elif not pane:
+            verdict = "skip (not in tmux — type the /compact yourself)"
+        elif state != "calm":
+            verdict = f"skip (pane {state})"
+        elif in_flight:
+            verdict = "skip (compaction already in flight)"
+        else:
+            verdict = "compact" if go else "would compact"
+            if go:
+                open(marker, "w").close()
+                subprocess.Popen(
+                    [sys.executable, SENTINEL, "--orchestrate", pane, marker, sid],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _slog(f"session={sid} ctx={ctx // 1000}K idle={idle:.0f}m "
+                      f"-> FIRE(watch) mode=auto (watch sweep)")
+                n_compact += 1
+        print(f"  LIVE {sid}  ctx {ctx // 1000:>4}K  idle {idle:6.0f}m  "
+              f"pane {pane or '-':<6} {verdict}")
+
+    # arm 2 — DEAD fat transcripts: surgical on-disk trim
+    n_trim = 0
+    seen = set()
+    for prof in discover_profiles():
+        for f in glob.glob(os.path.join(prof, "projects", "*", "*.jsonl")):
+            sid = os.path.basename(f)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            proj = os.path.basename(os.path.dirname(f))
+            if (prof, proj) in live_projects:
+                continue  # a running session lives in this project dir — hands off
+            try:
+                st = os.stat(f)
+            except OSError:
+                continue
+            if st.st_size < 2_000_000 or (now - st.st_mtime) / 60 < idle_min:
+                continue
+            ctx = _last_ctx_tail(f)
+            if ctx < ctx_min:
+                continue
+            shed, shed_ctx, blocks, reason = trim_transcript(f, keep_turns, go=go)
+            if reason:
+                if "refusing" in reason or "aborted" in reason:
+                    print(f"  DEAD {sid[:8]}  ctx {ctx // 1000:>4}K  skip ({reason})  {proj[:40]}")
+                continue  # too small / too few turns — stay quiet
+            tag = "trimmed" if go else "would trim"
+            print(f"  DEAD {sid[:8]}  ctx {ctx // 1000:>4}K  "
+                  f"{tag} {blocks} tool results: ~{shed_ctx // 4000}K tokens off "
+                  f"next resume ({shed // 1000:,}K chars off disk)  {proj[:40]}")
+            if go:
+                _slog(f"watch: session={sid[:8]} trimmed {shed // 1000}K chars "
+                      f"({blocks} tool results, kept last {keep_turns} turns)")
+                n_trim += 1
+    if go:
+        print(f"\n  {n_compact} compaction(s) dispatched · {n_trim} transcript(s) trimmed"
+              f" · backups: <transcript>.foreman-bak")
+
+
+def cmd_watch_install():
+    """Run the sweep every 15 min — systemd user timer where available."""
+    py = shutil.which("python3") or sys.executable
+    exec_line = f"{py} {os.path.join(FOREMAN_HOME, 'foreman.py')} watch --go"
+    if shutil.which("systemctl"):
+        unit_dir = os.path.expanduser("~/.config/systemd/user")
+        os.makedirs(unit_dir, exist_ok=True)
+        with open(os.path.join(unit_dir, "foreman-watch.service"), "w") as f:
+            f.write("[Unit]\nDescription=foreman watch — proactive Claude Code "
+                    "context cleanup\n\n[Service]\nType=oneshot\n"
+                    f"ExecStart={exec_line}\n")
+        with open(os.path.join(unit_dir, "foreman-watch.timer"), "w") as f:
+            f.write("[Unit]\nDescription=foreman watch every 15 min\n\n[Timer]\n"
+                    "OnBootSec=5min\nOnUnitActiveSec=15min\n\n[Install]\n"
+                    "WantedBy=timers.target\n")
+        subprocess.run(["systemctl", "--user", "daemon-reload"])
+        subprocess.run(["systemctl", "--user", "enable", "--now", "foreman-watch.timer"])
+        print("installed + started: foreman-watch.timer (every 15 min)")
+        print("  status : systemctl --user list-timers foreman-watch.timer")
+        print("  log    : tail -f ~/.local/state/foreman/sentinel.log")
+        print("  remove : systemctl --user disable --now foreman-watch.timer")
+    else:
+        print("no systemd — add this cron line (crontab -e):")
+        print(f"  */15 * * * * {exec_line}")
+
+
 # ──────────────────────────────── update ───────────────────────────────────
 
 def cmd_update():
@@ -1091,6 +1365,16 @@ def main():
     sp = sub.add_parser("session")
     sp.add_argument("match", nargs="?", help="session-id prefix, project-dir substring, or transcript path")
     sub.add_parser("savings")
+    wp = sub.add_parser("watch")
+    wp.add_argument("--go", action="store_true", help="execute (default: dry-run)")
+    wp.add_argument("--idle-min", type=int, default=60,
+                    help="only touch sessions idle at least this many minutes")
+    wp.add_argument("--ctx-min", type=int, default=150_000,
+                    help="only touch sessions at least this fat (resident tokens)")
+    wp.add_argument("--keep-turns", type=int, default=15,
+                    help="trim: protect tool payloads within the last N user turns")
+    wp.add_argument("--install", action="store_true",
+                    help="install a 15-min systemd user timer (or print the cron line)")
     sub.add_parser("update")
     sub.add_parser("version")
 
@@ -1110,6 +1394,9 @@ def main():
         cmd_session(a.match)
     elif a.cmd == "restart":
         cmd_restart(a.idle_min, a.go, a.target, a.force)
+    elif a.cmd == "watch":
+        cmd_watch_install() if a.install else \
+            cmd_watch(a.go, a.idle_min, a.ctx_min, a.keep_turns)
     elif a.cmd == "update":
         cmd_update()
     else:

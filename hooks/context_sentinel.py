@@ -14,25 +14,24 @@ TIERS (checked when you message a session):
                size one more busy turn costs more than the compaction pass.
 
 MODES (FOREMAN_MODE):
-  auto (default) — fully automatic when the session lives in a tmux pane:
-                   the hook BLOCKS your prompt (saving it first), types the
-                   surgical /compact into the pane, waits for it to finish,
-                   then resends your original message. No model cooperation
-                   required. Falls back to advise outside tmux or when a
-                   previous attempt is already in flight.
-  advise         — inject instructions asking the model to compact first
-                   (works everywhere; depends on the model following through).
-  block          — bounce the prompt back with the exact /compact to run.
-  off            — disabled.
+  advise (default) — inject instructions asking the model to compact first
+                     (works everywhere; depends on the model following through).
+  auto             — deferred compaction when the session lives in a tmux pane:
+                     your prompt goes through UNTOUCHED; a detached watcher
+                     waits for the turn to end and the pane to be verifiably
+                     calm for ~30s, then types the surgical /compact itself.
+                     Never blocks, never resends, never races you at the
+                     keyboard. Falls back to advise outside tmux.
+  block            — bounce the prompt back with the exact /compact to run.
+  off              — disabled.
 
-SAFETY (auto mode): the prompt text is persisted to
-~/.local/state/foreman/pending-<sid> BEFORE anything else and only deleted
-after a successful resend — a failure can never lose what you typed. An
-in-flight marker (10 min) prevents block/compact loops. The orchestrator only
-types when the pane is verifiably calm, and gives up loudly (log + kept
-pending file) rather than guessing. NOTE: auto mode injects keystrokes into
-your own tmux panes — read orchestrate() before adopting it, or use
-FOREMAN_MODE=advise for a zero-injection default.
+SAFETY (auto mode): the watcher only types into a pane that has been calm
+(empty prompt, no running turn, no open dialog) for three consecutive checks.
+Anything else — you typing, a permission dialog, a feedback prompt — and it
+keeps waiting, up to 30 min, then gives up silently and retries on the next
+trigger. A heartbeat marker (compacting-<sid>) prevents stacked watchers.
+NOTE: auto mode injects keystrokes into your own tmux panes — read
+orchestrate() before adopting it; advise is the zero-injection default.
 
 Every invocation logs to ~/.local/state/foreman/sentinel.log.
 The hook fails open: any error and your prompt proceeds untouched.
@@ -61,6 +60,10 @@ SURGICAL = (
     "are already in files/memory"
 )
 COMPACT_CMD = f"/compact {SURGICAL}"
+
+# The watcher's in-flight marker is refreshed every loop; older than this and
+# the watcher is presumed dead, so a new trigger may spawn a fresh one.
+MARKER_FRESH_S = 180
 
 
 def _log(msg):
@@ -108,58 +111,73 @@ def last_state(transcript_path):
     return ctx, idle
 
 
-# ─────────────────────────── auto-compact orchestrator ──────────────────────
+# ─────────────────────────── deferred-compact watcher ───────────────────────
 
 def _pane_calm(pane):
+    """True only when the pane is verifiably safe to type into: an empty
+    prompt box, no running turn, and no open dialog of any kind."""
     out = subprocess.run(["tmux", "capture-pane", "-t", pane, "-p"],
                          capture_output=True, text=True).stdout
-    if "to interrupt" in out:
+    if not out:
         return False
+    if "to interrupt" in out:            # a turn is running
+        return False
+    for needle in ("Do you want", "to proceed", "How is Claude doing"):
+        if needle in out:                # permission / feedback dialog is up
+            return False
     prompts = [l for l in out.splitlines() if l.lstrip().startswith("❯")]
     return bool(prompts) and not any(l.lstrip().lstrip("❯").strip() for l in prompts)
 
 
-def orchestrate(pane, pending_file, sid):
-    """Runs DETACHED after the hook blocked the prompt: type the surgical
-    /compact into the session's own pane, wait for it to finish, resend the
-    saved prompt. Gives up loudly (log + pending file kept) on any doubt."""
-    time.sleep(1.5)  # let the TUI settle after the block
-    deadline = time.time() + 20
-    while time.time() < deadline and not _pane_calm(pane):
-        time.sleep(1)
-    if not _pane_calm(pane):
-        _log(f"session={sid} auto: pane never settled — prompt kept at {pending_file}")
+def orchestrate(pane, marker, sid):
+    """Runs DETACHED after the user's prompt went through untouched: wait for
+    the turn to finish and the pane to stay calm for 3 consecutive checks
+    (~30s), then type the surgical /compact. Deferred-only, by design — the
+    v0.7.0 block-and-resend approach raced the human at the keyboard and could
+    strand messages; letting the turn run and compacting the gap after it is
+    race-free. Gives up silently after 30 min (next trigger retries)."""
+    time.sleep(3)  # let the just-submitted turn actually start
+    deadline = time.time() + 1800
+    stable = 0
+    while time.time() < deadline:
+        try:
+            os.utime(marker, None)       # heartbeat: holds the in-flight lock
+        except OSError:
+            pass
+        stable = stable + 1 if _pane_calm(pane) else 0
+        if stable >= 3:
+            break
+        time.sleep(10)
+    else:
+        _log(f"session={sid} auto: pane never calm within 30m — skipped, will retry")
+        _rm(marker)
         return
     subprocess.run(["tmux", "send-keys", "-t", pane, "-l", COMPACT_CMD])
     time.sleep(0.5)
     subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"])
-    _log(f"session={sid} auto: /compact typed, waiting")
+    _log(f"session={sid} auto: /compact typed")
     time.sleep(5)
-    deadline = time.time() + 360
-    while time.time() < deadline:
+    end = time.time() + 360
+    done = False
+    while time.time() < end:
+        try:
+            os.utime(marker, None)
+        except OSError:
+            pass
         if _pane_calm(pane):
+            done = True
             break
-        time.sleep(2)
-    else:
-        _log(f"session={sid} auto: compaction still running after 6m — "
-             f"prompt kept at {pending_file}; paste it manually")
-        return
+        time.sleep(5)
+    _log(f"session={sid} auto: compaction finished" if done else
+         f"session={sid} auto: compaction still running after 6m — leaving it be")
+    _rm(marker)
+
+
+def _rm(path):
     try:
-        prompt = open(pending_file, errors="ignore").read()
-    except OSError:
-        _log(f"session={sid} auto: pending file vanished")
-        return
-    if prompt.strip():
-        # multiline-safe resend via a tmux paste buffer (consumed with -d)
-        subprocess.run(["tmux", "load-buffer", "-b", "foreman-resend", pending_file])
-        subprocess.run(["tmux", "paste-buffer", "-b", "foreman-resend", "-d", "-t", pane])
-        time.sleep(0.5)
-        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"])
-    try:
-        os.remove(pending_file)
+        os.remove(path)
     except OSError:
         pass
-    _log(f"session={sid} auto: compaction done, prompt resent")
 
 
 # ──────────────────────────────── the hook ──────────────────────────────────
@@ -189,32 +207,31 @@ def main():
     ctx_k = ctx // 1000
 
     pane = os.environ.get("TMUX_PANE", "")
-    pending = os.path.join(STATE_DIR, f"pending-{sid}")
-    in_flight = os.path.exists(pending) and (time.time() - os.path.getmtime(pending)) < 600
 
-    if MODE == "auto" and pane and not in_flight:
+    if MODE == "auto" and pane:
+        marker = os.path.join(STATE_DIR, f"compacting-{sid}")
+        try:
+            in_flight = os.path.exists(marker) and \
+                (time.time() - os.path.getmtime(marker)) < MARKER_FRESH_S
+        except OSError:
+            in_flight = False
+        if in_flight:
+            _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) "
+                 f"mode=auto (compaction already in flight)")
+            return
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
-            with open(pending, "w") as f:
-                f.write(payload.get("prompt") or "")
+            open(marker, "w").close()
             subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__),
-                 "--orchestrate", pane, pending, sid],
+                 "--orchestrate", pane, marker, sid],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) mode=auto")
-            print(json.dumps({
-                "decision": "block",
-                "reason": (
-                    f"[foreman] This session holds ~{ctx_k}K tokens (mostly stale tool "
-                    f"traffic). Auto-compacting now — your message was saved and will be "
-                    f"sent automatically when it finishes (~1-2 min)."
-                ),
-            }))
+            _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) "
+                 f"mode=auto (compact scheduled for after this turn)")
+            return  # prompt proceeds untouched; compaction happens in the gap
         except Exception:
-            pass  # fall through to advise below on any orchestration failure
-        else:
-            return
+            pass  # fall through to advise on any orchestration failure
 
     if MODE == "block":
         _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) mode=block")
@@ -228,8 +245,7 @@ def main():
         }))
         return
 
-    fallback = " (auto unavailable: no tmux pane)" if MODE == "auto" and not pane else \
-               " (auto attempt already in flight)" if MODE == "auto" else ""
+    fallback = " (auto unavailable: no tmux pane)" if MODE == "auto" else ""
     _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) mode=advise{fallback}")
     print(json.dumps({
         "hookSpecificOutput": {
