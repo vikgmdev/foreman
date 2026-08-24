@@ -34,7 +34,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.4.4"
+__version__ = "0.5.0"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -532,6 +532,26 @@ def _tmux_pane_index(kids):
     return idx
 
 
+
+
+def _pane_state(pane):
+    """What the session's TUI is visibly doing — the truthful per-pane gate.
+    busy: mid-task · dialog: a prompt is open · draft: unsent text in the input
+    box · calm: empty prompt, safe to /exit · no-tui: nothing recognizable."""
+    out = subprocess.run(["tmux", "capture-pane", "-t", pane, "-p"],
+                         capture_output=True, text=True).stdout
+    if "to interrupt" in out:
+        return "busy"
+    if "Do you want" in out or "to proceed" in out:
+        return "dialog"
+    prompt_lines = [l for l in out.splitlines() if l.lstrip().startswith("❯")]
+    if not prompt_lines:
+        return "no-tui"
+    if any(l.lstrip().lstrip("❯").strip() for l in prompt_lines):
+        return "draft"
+    return "calm"
+
+
 def cmd_restart(idle_min=30, go=False, target=None, force=False):
     kids, info = _proc_table()
     pane_of = _tmux_pane_index(kids)
@@ -550,6 +570,8 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         except OSError:
             argv = ""
         kind = "tui"
+        nm = re.search(r"--name[= ]([^ ]+)", argv)
+        sname = nm.group(1) if nm else None
         if state == "Z" or not argv.strip():
             kind = "zombie"      # exited but unreaped — there is no session here
         elif " rc" in f" {argv} " or "remote-control" in argv:
@@ -573,7 +595,7 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         pane = pane_of.get(pid)
         rows.append({"pid": pid, "cfg": cfg, "profile": profile, "cwd": cwd,
                      "sid": sid, "idle": idle, "stale": stale, "pane": pane,
-                     "kind": kind})
+                     "kind": kind, "name": sname})
 
     # Sessions sharing one project dir cannot be told apart from outside the
     # process (the transcript is not held open) — resuming by "latest in dir"
@@ -594,7 +616,7 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         print("no running claude sessions found (that this user can inspect).")
         return
 
-    auto, manual = [], []
+    auto, manual, notes = [], [], []
     print(f"{'pid':>8} {'where':20} {'idle':>6} {'hooks':7} {'shr':3} {'profile':14} cwd")
     for r in sorted(rows, key=lambda r: (r["pane"] is None, r["cwd"])):
         where = f"tmux {r['pane'][1][:14]}" if r["pane"] else "other"
@@ -624,17 +646,33 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         # nothing verifiable to resume — recycling would strand the pane.
         if r["kind"] != "tui":
             continue  # remote-control clients and zombies are not recyclable sessions
+        state = _pane_state(r["pane"][0]) if r["pane"] else "no-tui"
+        r["pstate"] = state
         ready = (r["idle"] is not None and r["idle"] >= idle_min) or force
         if r["sid"] is None and not force:
             ready = False
         if r["shared"] > 1:
-            if ready:
+            # A NAMED session is unambiguous (`claude --resume <name>`), so a
+            # calm pane makes it auto-recyclable even in a shared dir — the
+            # pane's own state outranks the sibling-polluted dir idle.
+            if r["name"] and r["pane"] and state == "calm":
+                auto.append(r)
+            elif r["name"] and r["pane"]:
+                notes.append((r, f"named but pane is {state} — send/clear it and re-run"))
+            elif ready:
                 manual.append(r)
-        elif r["pane"] and ready:
+        elif r["pane"] and ready and state == "calm":
             auto.append(r)
+        elif r["pane"] and ready:
+            notes.append((r, f"idle but pane is {state} — skipped"))
         elif ready:
             manual.append(r)
 
+    if notes and not go:
+        print("\npane-state notes:")
+        for r, why in notes:
+            label = r["name"] or (r["pane"][1] if r["pane"] else r["pid"])
+            print(f"  {label}: {why}")
     if not go:
         print(f"\ndry-run: {len(auto)} auto-recyclable (tmux), "
               f"{len(manual)} manual, rest current/busy/self.")
@@ -680,7 +718,12 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         if not gone:
             print("  ✗ did not exit cleanly — skipped (a dialog may be open)")
             continue
-        resume = f"claude --resume {r['sid']}" if r["sid"] else "claude --continue"
+        if r["name"]:
+            import shlex
+            q = shlex.quote(r["name"])
+            resume = f"claude --resume {q} --name {q}"
+        else:
+            resume = f"claude --resume {r['sid']}" if r["sid"] else "claude --continue"
         if r["cfg"]:
             resume = f"CLAUDE_CONFIG_DIR={r['cfg']} {resume}"
         subprocess.run(["tmux", "send-keys", "-t", pane, resume, "Enter"])
