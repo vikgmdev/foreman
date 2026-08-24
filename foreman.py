@@ -13,6 +13,7 @@ Usage:
   foreman compare  [--tag NAME]            current window vs a baseline
   foreman ls                               list saved snapshots
   foreman hook install|uninstall|status    manage the context-sentinel hook
+  foreman restart [--go]                   recycle idle tmux sessions in place
   foreman update                           update foreman itself
   foreman version
 
@@ -32,7 +33,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -445,6 +446,179 @@ def cmd_hook(action, profile=None, mode="advise"):
         print("sessions once for the sentinel to take effect there.")
 
 
+
+
+# ─────────────────────────── session restarter ─────────────────────────────
+# Hooks are captured when a session starts — by design (they run arbitrary
+# shell, so Claude Code requires human review via /hooks for mid-session
+# changes; there is deliberately no remote reload). What foreman can do,
+# harness-agnostically:
+#   1. DETECT every running claude process (any terminal, any multiplexer),
+#      its profile, cwd, session and idle time — via /proc, no tmux required.
+#   2. AUTOMATE the recycle where the harness allows injecting input (tmux
+#      driver today: clean /exit + `claude --resume <same session>` in place).
+#   3. For everything else, print the exact per-session recipe: type /hooks
+#      inside it to review & apply without restarting, or exit + resume.
+
+import time
+
+
+def _proc_table():
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,etimes=,comm="],
+                         capture_output=True, text=True).stdout
+    kids, info = {}, {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, ppid, et, c = parts
+        kids.setdefault(ppid, []).append(pid)
+        info[pid] = (ppid, int(et), c)
+    return kids, info
+
+
+def _proc_env(pid):
+    try:
+        raw = open(f"/proc/{pid}/environ", "rb").read()
+        return {k.decode(errors="ignore"): v.decode(errors="ignore")
+                for k, v in (x.split(b"=", 1) for x in raw.split(b"\0") if b"=" in x)}
+    except Exception:
+        return {}
+
+
+def _is_ancestor(pid):
+    cur = os.getpid()
+    for _ in range(64):
+        if cur == pid:
+            return True
+        try:
+            with open(f"/proc/{cur}/stat") as f:
+                cur = int(f.read().split(") ")[-1].split()[1])
+        except Exception:
+            return False
+        if cur <= 1:
+            return False
+    return False
+
+
+def _latest_session(profile, cwd):
+    proj = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    files = glob.glob(os.path.join(profile, "projects", proj, "*.jsonl"))
+    if not files:
+        return None, None
+    f = max(files, key=os.path.getmtime)
+    return os.path.basename(f)[:-6], os.path.getmtime(f)
+
+
+def _tmux_pane_index(kids):
+    """claude pid -> (pane_id, tmux_session) for every tmux pane, if tmux exists."""
+    idx = {}
+    if not shutil.which("tmux"):
+        return idx
+    out = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{session_name}\t#{pane_pid}"],
+        capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        try:
+            pane, sess, pane_pid = line.split("\t")
+        except ValueError:
+            continue
+        stack = [pane_pid]
+        while stack:
+            p = stack.pop()
+            idx[p] = (pane, sess)
+            stack.extend(kids.get(p, []))
+    return idx
+
+
+def cmd_restart(idle_min=30, go=False, target=None, force=False):
+    kids, info = _proc_table()
+    pane_of = _tmux_pane_index(kids)
+    now = time.time()
+    rows = []
+    for pid, (ppid, etimes, comm) in info.items():
+        if comm != "claude":
+            continue
+        env = _proc_env(pid)
+        if not env:
+            continue  # not ours (other user) — /proc/environ unreadable
+        cfg = env.get("CLAUDE_CONFIG_DIR", "")
+        profile = cfg or os.path.expanduser("~/.claude")
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        sid, mtime = _latest_session(profile, cwd)
+        idle = (now - mtime) / 60 if mtime else None
+        started = now - etimes
+        settings = os.path.join(profile, "settings.json")
+        stale = os.path.exists(settings) and os.path.getmtime(settings) > started
+        pane = pane_of.get(pid)
+        rows.append({"pid": pid, "cfg": cfg, "profile": profile, "cwd": cwd,
+                     "sid": sid, "idle": idle, "stale": stale, "pane": pane})
+
+    if target:
+        rows = [r for r in rows if target in (r["pane"] or ("", ""))[0:2] or
+                target == r["pid"] or target in r["cwd"]]
+    if not rows:
+        print("no running claude sessions found (that this user can inspect).")
+        return
+
+    auto, manual = [], []
+    print(f"{'pid':>8} {'where':20} {'idle':>6} {'hooks':7} {'profile':14} cwd")
+    for r in sorted(rows, key=lambda r: (r["pane"] is None, r["cwd"])):
+        where = f"tmux {r['pane'][1][:14]}" if r["pane"] else "other"
+        prof = os.path.basename(r["cfg"]) if r["cfg"] else ".claude"
+        idle_s = f"{r['idle']:.0f}m" if r["idle"] is not None else "?"
+        hooks = "STALE" if r["stale"] else "current"
+        print(f"{r['pid']:>8} {where:20} {idle_s:>6} {hooks:7} {prof:14} {r['cwd']}")
+        if not r["stale"] and not force:
+            continue
+        if _is_ancestor(int(r["pid"])):
+            continue  # never recycle the session foreman is running inside
+        busy = r["idle"] is not None and r["idle"] < idle_min
+        if r["pane"] and not busy:
+            auto.append(r)
+        elif not busy:
+            manual.append(r)
+
+    if not go:
+        print(f"\ndry-run: {len(auto)} auto-recyclable (tmux), "
+              f"{len(manual)} manual, rest current/busy/self.")
+        if manual:
+            print("\nmanual sessions — apply WITHOUT restarting by typing /hooks inside")
+            print("each one (review & accept), or exit it and resume:")
+            for r in manual:
+                pre = f"CLAUDE_CONFIG_DIR={r['cfg']} " if r["cfg"] else ""
+                res = f"--resume {r['sid']}" if r["sid"] else "--continue"
+                print(f"  pid {r['pid']}: cd {r['cwd']} && {pre}claude {res}")
+        if auto:
+            print("\nrun with --go to recycle the tmux ones in place.")
+        return
+
+    for r in auto:
+        pane, sess = r["pane"]
+        print(f"\nrecycling {pane} ({sess}) ...")
+        subprocess.run(["tmux", "send-keys", "-t", pane, "/exit", "Enter"])
+        gone = False
+        for _ in range(40):
+            time.sleep(0.5)
+            k2, i2 = _proc_table()
+            if r["pid"] not in i2 or i2[r["pid"]][2] != "claude":
+                gone = True
+                break
+        if not gone:
+            print("  ✗ did not exit cleanly — skipped (a dialog may be open)")
+            continue
+        resume = f"claude --resume {r['sid']}" if r["sid"] else "claude --continue"
+        if r["cfg"]:
+            resume = f"CLAUDE_CONFIG_DIR={r['cfg']} {resume}"
+        subprocess.run(["tmux", "send-keys", "-t", pane, resume, "Enter"])
+        print(f"  ✓ relaunched: {resume}")
+    if manual:
+        print(f"\n{len(manual)} non-tmux session(s) still need /hooks or a manual resume (see dry-run).")
+
+
 # ──────────────────────────────── update ───────────────────────────────────
 
 def cmd_update():
@@ -477,6 +651,13 @@ def main():
     hp.add_argument("action", choices=["install", "uninstall", "status"])
     hp.add_argument("--profile", help="target one config dir (default: every ~/.claude*)")
     hp.add_argument("--mode", choices=["advise", "block"], default="advise")
+    rp = sub.add_parser("restart")
+    rp.add_argument("--idle-min", type=int, default=30,
+                    help="only recycle sessions idle at least this many minutes")
+    rp.add_argument("--go", action="store_true", help="execute (default: dry-run)")
+    rp.add_argument("--target", help="filter: pid, tmux pane/session, or cwd substring")
+    rp.add_argument("--force", action="store_true",
+                    help="ignore the idle check (NOT recommended)")
     sub.add_parser("update")
     sub.add_parser("version")
 
@@ -490,6 +671,8 @@ def main():
         cmd_ls()
     elif a.cmd == "hook":
         cmd_hook(a.action, a.profile, a.mode)
+    elif a.cmd == "restart":
+        cmd_restart(a.idle_min, a.go, a.target, a.force)
     elif a.cmd == "update":
         cmd_update()
     else:

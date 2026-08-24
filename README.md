@@ -136,8 +136,17 @@ foreman hook uninstall
 The hook **fails open** — any error and your prompt proceeds untouched.
 
 > [!NOTE]
-> Running sessions capture hooks at startup — restart long-lived sessions once
-> after installing.
+> Running sessions capture hooks at startup — that's a Claude Code security
+> design (hooks run shell commands; mid-session changes require human review
+> via `/hooks`, and there is deliberately no remote reload). `foreman restart`
+> handles it: it detects every running session via `/proc` — whatever terminal
+> or multiplexer it lives in — shows which ones are on stale hook config, and
+> where the harness allows input injection (tmux today) recycles them in place
+> with a clean `/exit` + `claude --resume <same session>`, same cwd, same
+> profile, nothing lost. Sessions it can't automate get the exact per-session
+> recipe (type `/hooks` inside to apply without restarting, or exit + resume).
+> It only ever touches sessions idle past `--idle-min` (default 30m), and it
+> never force-kills.
 
 ## Commands
 
@@ -148,6 +157,7 @@ The hook **fails open** — any error and your prompt proceeds untouched.
 | `foreman compare [--tag NAME]` | now vs baseline — leads with **normalized** metrics ($/user-turn, ctx/call), because raw totals track how much you worked, not how efficient you got |
 | `foreman ls` | list saved snapshots |
 | `foreman hook install\|uninstall\|status` | manage the sentinel across every `~/.claude*` profile |
+| `foreman restart [--go]` | find every **running** session (any terminal, any harness), flag the ones on stale hook config, and recycle the recyclable ones in place |
 | `foreman update` | update foreman itself |
 
 Multi-profile aware (`CLAUDE_CONFIG_DIR` setups included), duplicate sessions
