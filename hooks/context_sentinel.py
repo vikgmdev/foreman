@@ -38,11 +38,13 @@ import sys
 
 CTX_THRESHOLD = int(os.environ.get("FOREMAN_CTX_TOKENS", "150000"))
 IDLE_S = int(os.environ.get("FOREMAN_IDLE_S", "3600"))
-# Urgent tier: an extreme session gets cleaned at the first SHORT pause instead
-# of waiting for the hour — at this size, every agentic iteration re-reads the
-# whole thing, so the one-off compaction latency pays for itself immediately.
+# Urgent tier: an extreme session gets cleaned IMMEDIATELY — no idle required.
+# At ≥500K every agentic iteration re-reads the whole thing (~$1+ each on the
+# top tier), so even one more busy turn costs more than the one-off compaction
+# pass. It keeps firing on every message until the compaction actually lands.
+# Set FOREMAN_IDLE_URGENT_S to a number of seconds to make it politer.
 CTX_URGENT = int(os.environ.get("FOREMAN_CTX_URGENT", "500000"))
-IDLE_URGENT_S = int(os.environ.get("FOREMAN_IDLE_URGENT_S", "600"))
+IDLE_URGENT_S = int(os.environ.get("FOREMAN_IDLE_URGENT_S", "0"))
 MODE = os.environ.get("FOREMAN_MODE", "advise").lower()
 
 SURGICAL = (
