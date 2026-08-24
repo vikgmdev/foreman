@@ -33,7 +33,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -581,7 +581,14 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
     for r in sorted(rows, key=lambda r: (r["pane"] is None, r["cwd"])):
         where = f"tmux {r['pane'][1][:14]}" if r["pane"] else "other"
         prof = os.path.basename(r["cfg"]) if r["cfg"] else ".claude"
-        idle_s = f"{r['idle']:.0f}m" if r["idle"] is not None else "?"
+        # For shared project dirs the idle we can measure is the DIRECTORY's
+        # (any sibling's last write) — a lower bound for this pane, so ≥.
+        if r["idle"] is None:
+            idle_s = "?"
+        elif r["shared"] > 1:
+            idle_s = f"≥{r['idle']:.0f}m"
+        else:
+            idle_s = f"{r['idle']:.0f}m"
         hooks = "STALE" if r["stale"] else "current"
         shared = f"x{r['shared']}" if r["shared"] > 1 else "  "
         print(f"{r['pid']:>8} {where:20} {idle_s:>6} {hooks:7} {shared:3} {prof:14} {r['cwd']}")
