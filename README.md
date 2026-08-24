@@ -124,6 +124,7 @@ intervenes only when a session is **fat** (>150K resident) *and* **cold**
 | Mode | Behavior |
 |---|---|
 | `advise` *(default)* | instructs the model to compact surgically first — keep the last 15 turns and every decision verbatim, drop stale tool traffic |
+| `auto` | your prompt goes through untouched; once the turn ends and the session's tmux pane has been verifiably calm for ~30s, foreman types the surgical `/compact` itself. Never blocks, never races you at the keyboard. Opt-in (`--mode auto`) because it injects keystrokes into your own panes |
 | `block` | bounces your prompt back with the exact `/compact` command; nothing happens without you |
 | `off` | disabled |
 
@@ -159,6 +160,8 @@ The hook **fails open** — any error and your prompt proceeds untouched.
 | `foreman ls` | list saved snapshots |
 | `foreman hook install\|uninstall\|status` | manage the sentinel across every `~/.claude*` profile |
 | `foreman restart [--go]` | find every **running** session (any terminal, any harness), flag the ones on stale hook config, and recycle the recyclable ones in place |
+| `foreman watch [--go]` | one proactive sweep: type the surgical `/compact` into fat idle **live** sessions (calm tmux panes only), and trim fat **dead** transcripts on disk — stale tool payloads blanked, dialogue and structure intact, `.foreman-bak` backup always |
+| `foreman watch --install` | run that sweep every 15 min (systemd user timer, or prints the cron line) |
 | `foreman update` | update foreman itself |
 
 Multi-profile aware (`CLAUDE_CONFIG_DIR` setups included), duplicate sessions
@@ -186,10 +189,9 @@ deduped.
 foreman aims to be the **site office for your AI agents** — the boring,
 load-bearing tooling that keeps agent fleets on time and within budget:
 
-- `foreman watch` — background daemon: compact idle sessions before you even
-  message them, alert on runaway context growth
 - `foreman prefix` — startup-context analyzer: what those ~70K tokens are made
   of, per profile, and what to cut
+- alerting — flag runaway context growth before it becomes a whale
 - Fleet budgets — per-project / per-agent spend tracking and limits
 - Support for more agent harnesses beyond Claude Code
 
@@ -205,6 +207,12 @@ load-bearing tooling that keeps agent fleets on time and within budget:
   in source).
 - Context composition uses a chars/4 approximation; reported *shares* are
   robust to it, absolute token counts less so.
+- Transcript trimming (`watch`) saves **disk** unconditionally, but saves
+  **resume context** only for tool traffic newer than the session's last
+  compact boundary — resume replays from that boundary, not from the top.
+  Never-compacted fat sessions (most whales) benefit the most. Verified by
+  resuming a trimmed 41.6MB whale: byte-identical rebuilt prompt, zero
+  breakage.
 - foreman reads `~/.claude*/projects/*/*.jsonl` — the transcripts Claude Code
   already writes — and writes snapshots to `~/.local/state/foreman/`. No
   network calls, no telemetry, nothing leaves your machine.
