@@ -33,7 +33,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -557,6 +557,18 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         rows.append({"pid": pid, "cfg": cfg, "profile": profile, "cwd": cwd,
                      "sid": sid, "idle": idle, "stale": stale, "pane": pane})
 
+    # Sessions sharing one project dir cannot be told apart from outside the
+    # process (the transcript is not held open) — resuming by "latest in dir"
+    # would risk swapping conversations between panes. Only unambiguous
+    # (single-process) projects are auto-recyclable; the rest go manual.
+    groups = {}
+    for r in rows:
+        key = (r["profile"], re.sub(r"[^A-Za-z0-9]", "-", r["cwd"]))
+        groups.setdefault(key, []).append(r)
+    for key, grp in groups.items():
+        for r in grp:
+            r["shared"] = len(grp)
+
     if target:
         rows = [r for r in rows if target in (r["pane"] or ("", ""))[0:2] or
                 target == r["pid"] or target in r["cwd"]]
@@ -565,19 +577,25 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
         return
 
     auto, manual = [], []
-    print(f"{'pid':>8} {'where':20} {'idle':>6} {'hooks':7} {'profile':14} cwd")
+    print(f"{'pid':>8} {'where':20} {'idle':>6} {'hooks':7} {'shr':3} {'profile':14} cwd")
     for r in sorted(rows, key=lambda r: (r["pane"] is None, r["cwd"])):
         where = f"tmux {r['pane'][1][:14]}" if r["pane"] else "other"
         prof = os.path.basename(r["cfg"]) if r["cfg"] else ".claude"
         idle_s = f"{r['idle']:.0f}m" if r["idle"] is not None else "?"
         hooks = "STALE" if r["stale"] else "current"
-        print(f"{r['pid']:>8} {where:20} {idle_s:>6} {hooks:7} {prof:14} {r['cwd']}")
+        shared = f"x{r['shared']}" if r["shared"] > 1 else "  "
+        print(f"{r['pid']:>8} {where:20} {idle_s:>6} {hooks:7} {shared:3} {prof:14} {r['cwd']}")
         if not r["stale"] and not force:
             continue
         if _is_ancestor(int(r["pid"])):
             continue  # never recycle the session foreman is running inside
+        # idle is per-project-dir; with shared cwds one active sibling masks
+        # the rest, and the resume target would be a guess. Never guess.
         busy = r["idle"] is not None and r["idle"] < idle_min
-        if r["pane"] and not busy:
+        if r["shared"] > 1:
+            if not busy:
+                manual.append(r)
+        elif r["pane"] and not busy:
             auto.append(r)
         elif not busy:
             manual.append(r)
@@ -587,11 +605,21 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
               f"{len(manual)} manual, rest current/busy/self.")
         if manual:
             print("\nmanual sessions — apply WITHOUT restarting by typing /hooks inside")
-            print("each one (review & accept), or exit it and resume:")
+            print("each one (review & accept). For exited ones:")
+            seen_grp = set()
             for r in manual:
-                pre = f"CLAUDE_CONFIG_DIR={r['cfg']} " if r["cfg"] else ""
-                res = f"--resume {r['sid']}" if r["sid"] else "--continue"
-                print(f"  pid {r['pid']}: cd {r['cwd']} && {pre}claude {res}")
+                if r["shared"] > 1:
+                    key = (r["profile"], r["cwd"])
+                    if key in seen_grp:
+                        continue
+                    seen_grp.add(key)
+                    print(f"  {r['shared']} sessions share {r['cwd']} — sessions in a shared")
+                    print(f"    project dir can't be told apart from outside; inside each pane:")
+                    print(f"    /hooks to apply now, or /exit then `claude --resume` (picker).")
+                else:
+                    pre = f"CLAUDE_CONFIG_DIR={r['cfg']} " if r["cfg"] else ""
+                    res = f"--resume {r['sid']}" if r["sid"] else "--continue"
+                    print(f"  pid {r['pid']}: cd {r['cwd']} && {pre}claude {res}")
         if auto:
             print("\nrun with --go to recycle the tmux ones in place.")
         return
