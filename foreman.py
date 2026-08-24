@@ -33,7 +33,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -591,13 +591,17 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
             continue  # never recycle the session foreman is running inside
         # idle is per-project-dir; with shared cwds one active sibling masks
         # the rest, and the resume target would be a guess. Never guess.
-        busy = r["idle"] is not None and r["idle"] < idle_min
+        # Unknown idle (no transcript found) is NOT ready either: there is
+        # nothing verifiable to resume — recycling would strand the pane.
+        ready = (r["idle"] is not None and r["idle"] >= idle_min) or force
+        if r["sid"] is None and not force:
+            ready = False
         if r["shared"] > 1:
-            if not busy:
+            if ready:
                 manual.append(r)
-        elif r["pane"] and not busy:
+        elif r["pane"] and ready:
             auto.append(r)
-        elif not busy:
+        elif ready:
             manual.append(r)
 
     if not go:
