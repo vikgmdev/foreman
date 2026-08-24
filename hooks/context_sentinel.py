@@ -19,17 +19,21 @@ MODES (FOREMAN_MODE):
   auto             — deferred compaction when the session lives in a tmux pane:
                      your prompt goes through UNTOUCHED; a detached watcher
                      waits for the turn to end and the pane to be verifiably
-                     calm for ~30s, then types the surgical /compact itself.
-                     Never blocks, never resends, never races you at the
-                     keyboard. Falls back to advise outside tmux.
+                     calm for FOREMAN_CALM_S (default 5 min — a reading pause
+                     is not an absence), then types the surgical /compact
+                     itself. Never blocks, never resends, never races you at
+                     the keyboard. Falls back to advise outside tmux.
   block            — bounce the prompt back with the exact /compact to run.
   off              — disabled.
 
 SAFETY (auto mode): the watcher only types into a pane that has been calm
-(empty prompt, no running turn, no open dialog) for three consecutive checks.
-Anything else — you typing, a permission dialog, a feedback prompt — and it
-keeps waiting, up to 30 min, then gives up silently and retries on the next
-trigger. A heartbeat marker (compacting-<sid>) prevents stacked watchers.
+(empty prompt, no running turn, no open dialog) continuously for
+FOREMAN_CALM_S. Anything else — you typing, a permission dialog, a feedback
+prompt — and it keeps waiting, up to 45 min, then gives up silently and
+retries on the next trigger. After typing it verifies the command actually
+submitted (the slash-command menu can swallow the first Enter) and never
+presses Enter more than twice. A heartbeat marker (compacting-<sid>)
+prevents stacked watchers.
 NOTE: auto mode injects keystrokes into your own tmux panes — read
 orchestrate() before adopting it; advise is the zero-injection default.
 
@@ -64,6 +68,9 @@ COMPACT_CMD = f"/compact {SURGICAL}"
 # The watcher's in-flight marker is refreshed every loop; older than this and
 # the watcher is presumed dead, so a new trigger may spawn a fresh one.
 MARKER_FRESH_S = 180
+# The pane must be continuously calm this long before the watcher types — a
+# 30s gap is a human reading, not a human gone (learned the hard way).
+CALM_S = int(os.environ.get("FOREMAN_CALM_S", "300"))
 
 
 def _log(msg):
@@ -129,15 +136,25 @@ def _pane_calm(pane):
     return bool(prompts) and not any(l.lstrip().lstrip("❯").strip() for l in prompts)
 
 
+def _cmd_stuck(pane):
+    """True if our /compact is still sitting unsent in the input box."""
+    out = subprocess.run(["tmux", "capture-pane", "-t", pane, "-p"],
+                         capture_output=True, text=True).stdout
+    return any(l.lstrip().startswith("❯") and "/compact" in l
+               for l in out.splitlines())
+
+
 def orchestrate(pane, marker, sid):
     """Runs DETACHED after the user's prompt went through untouched: wait for
-    the turn to finish and the pane to stay calm for 3 consecutive checks
-    (~30s), then type the surgical /compact. Deferred-only, by design — the
-    v0.7.0 block-and-resend approach raced the human at the keyboard and could
-    strand messages; letting the turn run and compacting the gap after it is
-    race-free. Gives up silently after 30 min (next trigger retries)."""
+    the turn to finish and the pane to stay CONTINUOUSLY calm for CALM_S
+    (default 5 min — a human pausing to read is not a human gone), then type
+    the surgical /compact. Deferred-only, by design — the v0.7.0
+    block-and-resend approach raced the human at the keyboard and could
+    strand messages; letting the turn run and compacting a real gap after it
+    is race-free. Gives up silently after 45 min (next trigger retries)."""
     time.sleep(3)  # let the just-submitted turn actually start
-    deadline = time.time() + 1800
+    deadline = time.time() + 2700
+    need = max(1, CALM_S // 10)
     stable = 0
     while time.time() < deadline:
         try:
@@ -145,16 +162,27 @@ def orchestrate(pane, marker, sid):
         except OSError:
             pass
         stable = stable + 1 if _pane_calm(pane) else 0
-        if stable >= 3:
+        if stable >= need:
             break
         time.sleep(10)
     else:
-        _log(f"session={sid} auto: pane never calm within 30m — skipped, will retry")
+        _log(f"session={sid} auto: no {CALM_S // 60}m-calm gap within 45m — "
+             f"skipped, will retry on next trigger")
         _rm(marker)
         return
     subprocess.run(["tmux", "send-keys", "-t", pane, "-l", COMPACT_CMD])
     time.sleep(0.5)
     subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"])
+    time.sleep(2)
+    if _cmd_stuck(pane):
+        # the slash-command autocomplete menu can swallow the first Enter
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"])
+        time.sleep(2)
+    if _cmd_stuck(pane):
+        _log(f"session={sid} auto: /compact stuck in the input box — left as "
+             f"typed; press Enter to run it or clear it")
+        _rm(marker)
+        return
     _log(f"session={sid} auto: /compact typed")
     time.sleep(5)
     end = time.time() + 360

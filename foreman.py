@@ -37,7 +37,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")

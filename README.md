@@ -124,7 +124,7 @@ intervenes only when a session is **fat** (>150K resident) *and* **cold**
 | Mode | Behavior |
 |---|---|
 | `advise` *(default)* | instructs the model to compact surgically first — keep the last 15 turns and every decision verbatim, drop stale tool traffic |
-| `auto` | your prompt goes through untouched; once the turn ends and the session's tmux pane has been verifiably calm for ~30s, foreman types the surgical `/compact` itself. Never blocks, never races you at the keyboard. Opt-in (`--mode auto`) because it injects keystrokes into your own panes |
+| `auto` | your prompt goes through untouched; once the turn ends and the session's tmux pane has been **continuously calm for 5 min** (`FOREMAN_CALM_S`) — a reading pause is not an absence — foreman types the surgical `/compact` itself and verifies it actually submitted. Never blocks, never races you at the keyboard. Opt-in (`--mode auto`) because it injects keystrokes into your own panes |
 | `block` | bounces your prompt back with the exact `/compact` command; nothing happens without you |
 | `off` | disabled |
 
