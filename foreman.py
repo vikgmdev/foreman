@@ -34,7 +34,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -663,30 +663,122 @@ def cmd_restart(idle_min=30, go=False, target=None, force=False):
 
 # ──────────────────────────── single-session card ──────────────────────────
 
-def _find_transcripts(match):
-    hits = []
+def _all_transcripts():
+    rows = []
     for prof in discover_profiles():
         for f in glob.glob(os.path.join(prof, "projects", "*", "*.jsonl")):
-            if (match in os.path.basename(f) or match in os.path.basename(os.path.dirname(f))
-                    or match == f):
-                hits.append((os.path.getmtime(f), f, prof))
-    return sorted(hits, reverse=True)
+            try:
+                rows.append((os.path.getmtime(f), f, prof))
+            except OSError:
+                pass
+    return sorted(rows, reverse=True)
+
+
+def _list_sessions(limit=15):
+    rows = _all_transcripts()
+    print(f"most recent sessions ({min(limit, len(rows))} of {len(rows)}) — "
+          f"card one with: foreman session <id-prefix|pid|tmux-name>")
+    for mt, f, prof in rows[:limit]:
+        idle = (time.time() - mt) / 60
+        print(f"  {os.path.basename(f)[:12]}…  {idle:7.0f}m idle  "
+              f"{os.path.basename(prof):14} {os.path.basename(os.path.dirname(f))[:52]}")
+
+
+def _transcripts_for_pid(pid):
+    """Transcripts of the project dir a running claude pid lives in."""
+    env = _proc_env(pid)
+    if not env:
+        return [], None
+    profile = env.get("CLAUDE_CONFIG_DIR", "") or os.path.expanduser("~/.claude")
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return [], None
+    proj = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    files = sorted(glob.glob(os.path.join(profile, "projects", proj, "*.jsonl")),
+                   key=os.path.getmtime, reverse=True)
+    return [(os.path.getmtime(f), f, profile) for f in files], cwd
+
+
+def _pid_for_tmux_name(name):
+    if not shutil.which("tmux"):
+        return None
+    out = subprocess.run(["tmux", "list-panes", "-a", "-F",
+                          "#{session_name}\t#{pane_id}\t#{pane_pid}"],
+                         capture_output=True, text=True).stdout
+    kids, comm = {}, {}
+    k2, i2 = _proc_table()
+    for line in out.splitlines():
+        try:
+            sess, pane, pane_pid = line.split("\t")
+        except ValueError:
+            continue
+        if name in (sess, pane):
+            pid = _claude_pid_under(pane_pid, k2, {p: c for p, (_, _, c) in i2.items()})
+            if pid:
+                return pid
+    return None
+
+
+def _claude_pid_under(pane_pid, kids, comm):
+    stack = [str(pane_pid)]
+    while stack:
+        p = stack.pop()
+        if comm.get(p) == "claude":
+            return int(p)
+        stack.extend(kids.get(p, []))
+    return None
 
 
 def cmd_session(match):
-    hits = _find_transcripts(match)
+    if not match or match == "ls":
+        _list_sessions()
+        return
+    hits = []
+    via = None
+    if match.isdigit() and os.path.isdir(f"/proc/{match}"):
+        hits, cwd = _transcripts_for_pid(match)
+        via = f"pid {match} ({cwd})"
     if not hits:
-        sys.exit(f"no session matches '{match}' (try a session-id prefix or a project-dir substring)")
-    if len(hits) > 1:
-        print(f"{len(hits)} sessions match '{match}' — newest first; narrow with a session-id prefix:")
+        pid = _pid_for_tmux_name(match)
+        if pid:
+            hits, cwd = _transcripts_for_pid(str(pid))
+            via = f"tmux '{match}' → pid {pid} ({cwd})"
+    if not hits:
+        for mt, f, prof in _all_transcripts():
+            if (match in os.path.basename(f)
+                    or match in os.path.basename(os.path.dirname(f)) or match == f):
+                hits.append((mt, f, prof))
+    if not hits:
+        sys.exit(f"no session matches '{match}' — try `foreman session` (list), a "
+                 f"session-id prefix, a running pid, a tmux session name, or a "
+                 f"project-dir substring")
+    if via:
+        print(f"resolved via {via}\n")
+    if len(hits) > 1 and via:
+        # A pid/tmux name in a SHARED project dir: which transcript is this
+        # process's cannot be known from outside — same rule as restart: no guessing.
+        print(f"{len(hits)} sessions live in that project dir — a specific pid's own "
+              f"transcript can't be identified from outside.")
+        print(f"newest first; card one with its id prefix:")
         for mt, f, prof in hits[:8]:
-            age = (time.time() - mt) / 60
-            print(f"  {os.path.basename(f)[:12]}…  {age:7.0f}m idle  {os.path.basename(os.path.dirname(f))}")
+            idle = (time.time() - mt) / 60
+            print(f"  {os.path.basename(f)[:12]}…  {idle:7.0f}m idle")
+        return
+    if len(hits) > 1:
+        print(f"{len(hits)} sessions match '{match}' — newest first; narrow with a "
+              f"session-id prefix:")
+        for mt, f, prof in hits[:8]:
+            idle = (time.time() - mt) / 60
+            print(f"  {os.path.basename(f)[:12]}…  {idle:7.0f}m idle  "
+                  f"{os.path.basename(os.path.dirname(f))[:52]}")
         if len(hits) > 8:
             print(f"  … and {len(hits) - 8} more")
         return
-    _, path, prof = hits[0]
+    _session_card(hits[0][1], hits[0][2])
 
+
+def _session_card(path, prof):
     calls = 0
     cost = 0.0
     ctx_now = 0
@@ -722,7 +814,6 @@ def cmd_session(match):
             if ts:
                 first_ts = first_ts or ts
                 last_ts = ts
-            # a compaction / clear shows up as a sharp resident-context drop
             if prev_ctx > 50_000 and ctx < prev_ctx * 0.7:
                 drops.append((ts or "?", prev_ctx, ctx))
             if ctx:
@@ -795,7 +886,7 @@ def main():
     rp.add_argument("--force", action="store_true",
                     help="ignore the idle check (NOT recommended)")
     sp = sub.add_parser("session")
-    sp.add_argument("match", help="session-id prefix, project-dir substring, or transcript path")
+    sp.add_argument("match", nargs="?", help="session-id prefix, project-dir substring, or transcript path")
     sub.add_parser("update")
     sub.add_parser("version")
 
