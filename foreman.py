@@ -18,6 +18,7 @@ Usage:
   foreman savings                          $ actually saved by sentinel-triggered compactions
   foreman watch [--go]                     sweep: compact calm idle tmux sessions, trim dead fat transcripts
   foreman watch --install                  run that sweep every 15 min (systemd user timer / cron)
+  foreman voice build|install              distill YOUR writing style from your own messages; install it as a skill
   foreman update                           update foreman itself
   foreman version
 
@@ -37,7 +38,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1390,6 +1391,154 @@ def cmd_watch_install():
         print(f"  */15 * * * * {exec_line}")
 
 
+# ──────────────────────────────── voice ────────────────────────────────────
+# Your transcripts hold thousands of messages YOU typed. `voice build`
+# distills them — one cheap headless model call — into a personal style
+# profile (LOCAL, never in any repo), and `voice install` drops a tiny skill
+# into every profile so the model loads that profile exactly when it is about
+# to write something on your behalf, and never pays for it otherwise.
+
+VOICE_FILE = os.path.join(STATE_DIR, "voice.md")
+
+VOICE_INSTRUCTION = """\
+You are analyzing WRITING SAMPLES: real messages one person typed to an AI
+coding assistant over months (separated by lines containing only ---).
+Distill a reusable STYLE PROFILE so a writer can produce text that sounds
+exactly like this person. Extract STYLE, never content — do not quote
+anything sensitive (names, projects, credentials, business details).
+
+Cover, with short verbatim examples of tics where safe:
+- language mix and code-switching habits (which language when, and why)
+- typical message length, rhythm, and structure
+- capitalization, punctuation, and typo tolerance (they type fast — what
+  kinds of typos/abbreviations are characteristic?)
+- greetings/closings, or their absence
+- directness: how they ask, how they decide, how they push back
+- characteristic phrases, connectors and tics (list them verbatim)
+- emoji/emoticon usage (or absence)
+- formality range: quick command vs discussion vs frustration
+- what this person would NEVER write
+
+End with 5 invented example messages in their voice (varied intents).
+Output plain markdown, at most ~150 lines. Start with '# voice profile'.
+"""
+
+VOICE_SKILL = """\
+---
+name: voice
+description: Use when drafting ANY text that will be sent or published as the user — messages, emails, chat replies, posts, PR/issue text, commit-adjacent prose. Loads their personal writing-style profile so the result sounds like them, not like an AI.
+---
+
+Read {voice_file} — the user's distilled writing-style profile — and imitate
+it strictly whenever you write something the user will send as their own:
+language choice and code-switching, message length, punctuation habits,
+directness, characteristic phrases, emoji policy. Draft in their voice, not
+yours; when in doubt, shorter and more direct. If that file does not exist,
+tell the user to run: foreman voice build
+"""
+
+
+def _collect_voice_samples(sample=400):
+    msgs = {}
+    seen_sid = set()
+    for prof in discover_profiles():
+        for f in glob.glob(os.path.join(prof, "projects", "*", "*.jsonl")):
+            sid = os.path.basename(f)
+            if sid in seen_sid:
+                continue
+            seen_sid.add(sid)
+            try:
+                fh = open(f, errors="ignore")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if '"user"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "user" or d.get("isMeta") or \
+                            d.get("isSidechain") or "toolUseResult" in d:
+                        continue
+                    c = (d.get("message") or {}).get("content")
+                    if isinstance(c, list):
+                        c = " ".join(b.get("text", "") for b in c
+                                     if isinstance(b, dict) and b.get("type") == "text")
+                    if not isinstance(c, str):
+                        continue
+                    t = c.strip()
+                    if not (8 <= len(t) <= 800) or t.count("\n") > 10:
+                        continue  # too short to carry voice / probably a paste
+                    if t.startswith(("<", "/", "!", "Caveat:")):
+                        continue  # command wrappers, slash commands, injected
+                    if any(m in t for m in ("<system-reminder", "<command-",
+                                            "<local-command", "<cross-session",
+                                            "tool_result", "```")):
+                        continue
+                    msgs.setdefault(t, d.get("timestamp") or "")
+    rows = sorted(msgs.items(), key=lambda kv: kv[1])
+    if len(rows) > sample:
+        step = len(rows) / sample   # even chronological spread, old to new
+        rows = [rows[int(i * step)] for i in range(sample)]
+    return [t for t, _ in rows], len(msgs)
+
+
+def cmd_voice(action, sample=400, model="sonnet"):
+    if action == "show":
+        if os.path.exists(VOICE_FILE):
+            print(open(VOICE_FILE).read())
+        else:
+            print(f"no profile yet — run: foreman voice build   ({VOICE_FILE})")
+        return
+    if action == "install":
+        if not os.path.exists(VOICE_FILE):
+            print("build the profile first: foreman voice build")
+            return
+        for prof in discover_profiles():
+            d = os.path.join(prof, "skills", "voice")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "SKILL.md"), "w") as f:
+                f.write(VOICE_SKILL.format(voice_file=VOICE_FILE))
+            print(f"  installed skill: {os.path.join(d, 'SKILL.md')}")
+        print("running sessions pick it up on restart; new sessions immediately.")
+        return
+    if action == "uninstall":
+        for prof in discover_profiles():
+            p = os.path.join(prof, "skills", "voice", "SKILL.md")
+            if os.path.exists(p):
+                os.remove(p)
+                print(f"  removed {p}")
+        return
+    # build
+    if not shutil.which("claude"):
+        print("voice build needs the claude CLI on PATH")
+        return
+    samples, total = _collect_voice_samples(sample)
+    if len(samples) < 50:
+        print(f"only {len(samples)} usable messages found — not enough to hear a voice")
+        return
+    print(f"distilling {len(samples)} of {total:,} messages (one {model} call)…")
+    env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+    env["FOREMAN_MODE"] = "off"
+    os.makedirs(STATE_DIR, exist_ok=True)
+    r = subprocess.run(["claude", "-p", "--model", model],
+                       input=VOICE_INSTRUCTION + "\n\n" + "\n---\n".join(samples),
+                       capture_output=True, text=True, timeout=600,
+                       cwd=STATE_DIR, env=env)
+    out = (r.stdout or "").strip()
+    if "# voice profile" not in out or len(out) < 400:
+        print("model returned something unusable — profile NOT written:")
+        print((out or r.stderr)[:500])
+        return
+    with open(VOICE_FILE, "w") as f:
+        f.write(out + "\n")
+    print(f"wrote {VOICE_FILE} ({len(out.splitlines())} lines). Preview:\n")
+    print("\n".join(out.splitlines()[:12]))
+    print("\nnext: foreman voice install   (adds the skill to every profile)")
+
+
 # ──────────────────────────────── update ───────────────────────────────────
 
 def cmd_update():
@@ -1442,6 +1591,12 @@ def main():
                     help="trim: protect tool payloads within the last N user turns")
     wp.add_argument("--install", action="store_true",
                     help="install a 15-min systemd user timer (or print the cron line)")
+    vp = sub.add_parser("voice")
+    vp.add_argument("action", choices=["build", "install", "show", "uninstall"])
+    vp.add_argument("--sample", type=int, default=400,
+                    help="messages fed to the distillation call")
+    vp.add_argument("--model", default="sonnet",
+                    help="model for the one distillation call")
     sub.add_parser("update")
     sub.add_parser("version")
 
@@ -1464,6 +1619,8 @@ def main():
     elif a.cmd == "watch":
         cmd_watch_install() if a.install else \
             cmd_watch(a.go, a.idle_min, a.ctx_min, a.keep_turns)
+    elif a.cmd == "voice":
+        cmd_voice(a.action, a.sample, a.model)
     elif a.cmd == "update":
         cmd_update()
     else:
