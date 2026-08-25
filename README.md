@@ -182,6 +182,18 @@ whole fleet without waiting:
 > It only ever touches sessions idle past `--idle-min` (default 30m), and it
 > never force-kills.
 
+## Sound like yourself: `foreman voice`
+
+Your transcripts already contain thousands of messages **you** typed.
+`foreman voice build` samples them across their whole timeline (pastes,
+commands and subagent traffic filtered out) and distills a **style profile**
+— language mix, rhythm, punctuation, characteristic phrases — via one cheap
+headless model call. The profile is written to your local state dir and
+**never leaves your machine**. `foreman voice install` then adds a tiny
+skill to every profile: the model loads your voice exactly when it's about
+to draft something sent as you — an email, a reply, a post — and pays zero
+context tokens the rest of the time.
+
 ## Commands
 
 | Command | What it does |
@@ -196,6 +208,7 @@ whole fleet without waiting:
 | `foreman restart [--go]` | find every **running** session (any terminal, any harness), flag the ones on stale hook config, and recycle the recyclable ones in place |
 | `foreman watch [--go]` | one proactive sweep: type the surgical `/compact` into fat idle **live** sessions (calm tmux panes only), and trim fat **dead** transcripts on disk — stale tool payloads blanked, dialogue and structure intact, `.foreman-bak` backup always |
 | `foreman watch --install` | run that sweep every 15 min (systemd user timer, or prints the cron line) |
+| `foreman voice build\|install\|show` | distill **your** writing style from your own messages into a local profile, installed as an on-demand skill — the assistant writes *as you* only when writing *for* you |
 | `foreman update` | update foreman itself |
 
 Multi-profile aware (`CLAUDE_CONFIG_DIR` setups included), duplicate sessions
