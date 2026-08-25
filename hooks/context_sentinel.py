@@ -148,8 +148,8 @@ def orchestrate(pane, marker, sid):
     """Runs DETACHED after the user's prompt went through untouched: wait for
     the turn to finish and the pane to stay CONTINUOUSLY calm for CALM_S
     (default 5 min — a human pausing to read is not a human gone), then type
-    the surgical /compact. Deferred-only, by design — the v0.7.0
-    block-and-resend approach raced the human at the keyboard and could
+    the surgical /compact. Deferred-only, by design — an earlier
+    block-and-resend design raced the human at the keyboard and could
     strand messages; letting the turn run and compacting a real gap after it
     is race-free. Gives up silently after 45 min (next trigger retries)."""
     time.sleep(3)  # let the just-submitted turn actually start

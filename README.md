@@ -7,6 +7,7 @@
 **foreman finds out where your Claude Code tokens actually go — then trims the
 dead weight, automatically, at the one moment trimming is free.**
 
+[![Latest tag](https://img.shields.io/github/v/tag/vikgmdev/foreman?label=version&color=blue)](https://github.com/vikgmdev/foreman/tags)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#)
 [![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#)
@@ -28,6 +29,8 @@ That's it. Then:
 foreman audit --deep      # see where your tokens actually go
 foreman snapshot          # freeze the "before"
 foreman hook install      # enable automatic context trimming
+foreman watch --install   # proactive cleanup sweep every 15 min
+foreman savings           # $ actually saved so far, attributed per compaction
 foreman compare           # days later: prove the savings — or disprove them
 ```
 
@@ -117,9 +120,15 @@ This timing also kills auto-compact's classic failure mode — firing mid-task
 and destroying the plan you were in the middle of. A session idle for an hour
 is, by definition, between things.
 
-`foreman hook install` puts this on autopilot: a `UserPromptSubmit` hook that
-intervenes only when a session is **fat** (>150K resident) *and* **cold**
-(idle >1h):
+`foreman hook install` puts this on autopilot: a `UserPromptSubmit` hook (the
+**sentinel**) with two triggers:
+
+- **idle tier** — the session is **fat** (>150K resident) *and* **cold**
+  (idle >1h): the free moment, the cache is dead anyway.
+- **urgent tier** — the session is **huge** (>500K resident), no idle
+  required: at that size one more busy turn costs more than the compaction.
+
+When either fires:
 
 | Mode | Behavior |
 |---|---|
@@ -135,7 +144,30 @@ foreman hook status
 foreman hook uninstall
 ```
 
-The hook **fails open** — any error and your prompt proceeds untouched.
+The hook **fails open** — any error and your prompt proceeds untouched. Every
+invocation is logged to `~/.local/state/foreman/sentinel.log`, and every
+compaction it causes is measured after the fact: `foreman savings`
+cross-references that log with what actually happened in each transcript and
+reports **realized** dollars — actual calls that ran on the smaller context —
+not projections.
+
+## The sweep: `foreman watch`
+
+The sentinel acts when you message a session. `foreman watch` acts on the
+whole fleet without waiting:
+
+- **Live sessions** — fat, idle >1h, sitting in a *verifiably calm* tmux pane:
+  the surgical `/compact` is typed in-band by the same deferred watcher the
+  sentinel uses. Sessions sharing a cwd are only touched once they're
+  **pane-mapped** — the sentinel registers pane↔session↔transcript from
+  inside every session it runs in, so the mapping is knowledge, not guesswork.
+- **Dead sessions** — no process, fat transcript on disk: stale tool payloads
+  are blanked **in the transcript itself** (dialogue, decisions and structure
+  intact, `.foreman-bak` backup always), so the next `--resume` rebuilds a
+  fraction of the context. No LLM involved — deterministic, free, reversible.
+
+`foreman watch` is a dry-run; `--go` executes; `--install` runs it every
+15 minutes as a systemd user timer (or prints the cron line).
 
 > [!NOTE]
 > Running sessions capture hooks at startup — that's a Claude Code security
@@ -158,7 +190,9 @@ The hook **fails open** — any error and your prompt proceeds untouched.
 | `foreman snapshot [--tag NAME]` | freeze current metrics as a baseline |
 | `foreman compare [--tag NAME]` | now vs baseline — leads with **normalized** metrics ($/user-turn, ctx/call), because raw totals track how much you worked, not how efficient you got |
 | `foreman ls` | list saved snapshots |
-| `foreman hook install\|uninstall\|status` | manage the sentinel across every `~/.claude*` profile |
+| `foreman hook install\|uninstall\|status` | manage the sentinel across every `~/.claude*` profile; `--mode advise\|auto\|block` |
+| `foreman session <id\|project>` | one session's card: context curve, cost, compactions |
+| `foreman savings` | realized $ saved, attributed per sentinel-triggered compaction |
 | `foreman restart [--go]` | find every **running** session (any terminal, any harness), flag the ones on stale hook config, and recycle the recyclable ones in place |
 | `foreman watch [--go]` | one proactive sweep: type the surgical `/compact` into fat idle **live** sessions (calm tmux panes only), and trim fat **dead** transcripts on disk — stale tool payloads blanked, dialogue and structure intact, `.foreman-bak` backup always |
 | `foreman watch --install` | run that sweep every 15 min (systemd user timer, or prints the cron line) |
