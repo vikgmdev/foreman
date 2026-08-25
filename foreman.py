@@ -38,7 +38,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1399,6 +1399,11 @@ def cmd_watch_install():
 # to write something on your behalf, and never pays for it otherwise.
 
 VOICE_FILE = os.path.join(STATE_DIR, "voice.md")
+# Corrections the user typed themselves. They outrank the distilled analysis
+# (the person knows their own voice better than a sample of it does) and they
+# SURVIVE rebuilds — kept in their own file and re-appended on every build.
+VOICE_NOTES = os.path.join(STATE_DIR, "voice-notes.md")
+NOTES_HEADER = "\n## Corrections from the user — these OVERRIDE everything above\n"
 
 VOICE_INSTRUCTION = """\
 You are analyzing WRITING SAMPLES: real messages one person typed to an AI
@@ -1433,8 +1438,14 @@ Read {voice_file} — the user's distilled writing-style profile — and imitate
 it strictly whenever you write something the user will send as their own:
 language choice and code-switching, message length, punctuation habits,
 directness, characteristic phrases, emoji policy. Draft in their voice, not
-yours; when in doubt, shorter and more direct. If that file does not exist,
-tell the user to run: foreman voice build
+yours; when in doubt, shorter and more direct.
+
+The "Corrections from the user" section at the end of that file OUTRANKS the
+analysis above it — it is the user correcting the profile in their own words.
+
+If the file does not exist, tell the user to run: foreman voice build
+If the user says a draft does not sound like them, capture the correction so
+it sticks: foreman voice tune "<what was wrong, in their words>"
 """
 
 
@@ -1480,12 +1491,46 @@ def _collect_voice_samples(sample=400):
                     msgs.setdefault(t, d.get("timestamp") or "")
     rows = sorted(msgs.items(), key=lambda kv: kv[1])
     if len(rows) > sample:
-        step = len(rows) / sample   # even chronological spread, old to new
-        rows = [rows[int(i * step)] for i in range(sample)]
+        # Recency-weighted: 60% of the sample from the most recent third. A
+        # voice drifts, and the current one is the one worth imitating.
+        cut = int(len(rows) * 2 / 3)
+        old, new = rows[:cut], rows[cut:]
+        n_new = min(len(new), int(sample * 0.6))
+        n_old = sample - n_new
+        pick = []
+        for src, n in ((old, n_old), (new, n_new)):
+            if not src or n <= 0:
+                continue
+            step = len(src) / n
+            pick += [src[int(i * step)] for i in range(n)]
+        rows = pick
     return [t for t, _ in rows], len(msgs)
 
 
-def cmd_voice(action, sample=400, model="sonnet"):
+def _append_notes(dest_text):
+    """Corrections always ride at the end of the profile, verbatim."""
+    if not os.path.exists(VOICE_NOTES):
+        return dest_text
+    notes = open(VOICE_NOTES).read().strip()
+    return dest_text.rstrip() + "\n" + NOTES_HEADER + "\n" + notes + "\n" if notes \
+        else dest_text
+
+
+def cmd_voice(action, sample=400, model="sonnet", text=None):
+    if action == "tune":
+        if not text:
+            print('usage: foreman voice tune "shorter, fewer references, more commands"')
+            return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(VOICE_NOTES, "a") as f:
+            f.write(f"- {text.strip()}\n")
+        if os.path.exists(VOICE_FILE):   # re-stamp the live profile immediately
+            body = open(VOICE_FILE).read().split(NOTES_HEADER)[0]
+            with open(VOICE_FILE, "w") as f:
+                f.write(_append_notes(body))
+        print(f"noted. corrections now in effect ({VOICE_NOTES}):\n")
+        print(open(VOICE_NOTES).read().rstrip())
+        return
     if action == "show":
         if os.path.exists(VOICE_FILE):
             print(open(VOICE_FILE).read())
@@ -1533,8 +1578,9 @@ def cmd_voice(action, sample=400, model="sonnet"):
         print((out or r.stderr)[:500])
         return
     with open(VOICE_FILE, "w") as f:
-        f.write(out + "\n")
-    print(f"wrote {VOICE_FILE} ({len(out.splitlines())} lines). Preview:\n")
+        f.write(_append_notes(out + "\n"))
+    print(f"wrote {VOICE_FILE} ({len(out.splitlines())} lines"
+          f"{' + your corrections' if os.path.exists(VOICE_NOTES) else ''}). Preview:\n")
     print("\n".join(out.splitlines()[:12]))
     print("\nnext: foreman voice install   (adds the skill to every profile)")
 
@@ -1592,7 +1638,8 @@ def main():
     wp.add_argument("--install", action="store_true",
                     help="install a 15-min systemd user timer (or print the cron line)")
     vp = sub.add_parser("voice")
-    vp.add_argument("action", choices=["build", "install", "show", "uninstall"])
+    vp.add_argument("action", choices=["build", "install", "show", "tune", "uninstall"])
+    vp.add_argument("text", nargs="?", help='tune: the correction, in your words')
     vp.add_argument("--sample", type=int, default=400,
                     help="messages fed to the distillation call")
     vp.add_argument("--model", default="sonnet",
@@ -1620,7 +1667,7 @@ def main():
         cmd_watch_install() if a.install else \
             cmd_watch(a.go, a.idle_min, a.ctx_min, a.keep_turns)
     elif a.cmd == "voice":
-        cmd_voice(a.action, a.sample, a.model)
+        cmd_voice(a.action, a.sample, a.model, a.text)
     elif a.cmd == "update":
         cmd_update()
     else:
