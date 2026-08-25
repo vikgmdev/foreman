@@ -38,7 +38,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1436,9 +1436,19 @@ description: Use when drafting ANY text that will be sent or published as the us
 
 Read {voice_file} — the user's distilled writing-style profile — and imitate
 it strictly whenever you write something the user will send as their own:
-language choice and code-switching, message length, punctuation habits,
-directness, characteristic phrases, emoji policy. Draft in their voice, not
+language choice and code-switching, message length, rhythm, directness,
+characteristic phrases, vocabulary, emoji policy. Draft in their voice, not
 yours; when in doubt, shorter and more direct.
+
+**Voice, not typing errors.** The profile describes how the user types when
+moving fast, which includes mistakes. Reproduce the STYLE; write correct
+prose. So: keep their brevity, word choice, bluntness and structure — but
+spell correctly, use apostrophes ("its" -> "it's", "thats" -> "that's",
+"anupams" -> "Anupam's"), capitalize sentences and proper nouns, and keep
+grammar clean. Lowercase-everything, dropped apostrophes and typos are
+speed artifacts, not their voice. Deliberate stylistic choices (fragments,
+one-word replies, technical shorthand, no greeting/closing) ARE their voice
+— keep those.
 
 The "Corrections from the user" section at the end of that file OUTRANKS the
 analysis above it — it is the user correcting the profile in their own words.
