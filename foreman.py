@@ -37,7 +37,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1367,8 +1367,13 @@ def cmd_watch_install():
         unit_dir = os.path.expanduser("~/.config/systemd/user")
         os.makedirs(unit_dir, exist_ok=True)
         with open(os.path.join(unit_dir, "foreman-watch.service"), "w") as f:
+            # KillMode=process: the sweep spawns DETACHED compaction watchers;
+            # the default control-group kill would murder them the moment the
+            # oneshot exits. TimeoutStartSec: tail-scanning many transcripts
+            # can exceed systemd's 90s default.
             f.write("[Unit]\nDescription=foreman watch — proactive Claude Code "
                     "context cleanup\n\n[Service]\nType=oneshot\n"
+                    "KillMode=process\nTimeoutStartSec=15min\n"
                     f"ExecStart={exec_line}\n")
         with open(os.path.join(unit_dir, "foreman-watch.timer"), "w") as f:
             f.write("[Unit]\nDescription=foreman watch every 15 min\n\n[Timer]\n"
