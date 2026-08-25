@@ -223,6 +223,20 @@ def main():
         _log("no-transcript")
         return
     sid = os.path.basename(transcript)[:8]
+    pane = os.environ.get("TMUX_PANE", "")
+    if pane:
+        # pane-map: the sentinel runs INSIDE the session, so it is the one
+        # component that knows pane<->session<->transcript for certain. Every
+        # invocation (even a pass) registers the mapping; `foreman watch`
+        # consumes it to act precisely where shared cwds make guessing unsafe.
+        try:
+            d = os.path.join(STATE_DIR, "pane-map")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, sid), "w") as f:
+                json.dump({"pane": pane, "transcript": transcript,
+                           "ts": time.time()}, f)
+        except Exception:
+            pass
     ctx, idle = last_state(transcript)
     scheduled = ctx >= CTX_THRESHOLD and idle >= IDLE_S
     urgent = ctx >= CTX_URGENT and idle >= IDLE_URGENT_S
@@ -233,8 +247,6 @@ def main():
         return
     why = "urgent" if urgent and not scheduled else "idle"
     ctx_k = ctx // 1000
-
-    pane = os.environ.get("TMUX_PANE", "")
 
     if MODE == "auto" and pane:
         marker = os.path.join(STATE_DIR, f"compacting-{sid}")

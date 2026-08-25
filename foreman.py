@@ -37,7 +37,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1033,11 +1033,13 @@ def cmd_savings():
                     saved += (drop_a - ctx) * pw / 1e6  # a cold rewrite that was smaller
                 prev_t = tn
         if drop_a:
-            attributed += 1
-            total_shed += drop_a - drop_b
-            total_saved += saved
-            dedupe = " (repeat)" if key in seen else ""
-            seen.add(key)
+            key2 = (key, drop_a, drop_b)   # same sid can compact more than once;
+            dedupe = " (repeat)" if key2 in seen else ""   # same drop counts once
+            if not dedupe:
+                attributed += 1
+                total_shed += drop_a - drop_b
+                total_saved += saved
+            seen.add(key2)
             print(f"  {f['ts']}  {f['sid']}: {drop_a // 1000}K → {drop_b // 1000}K "
                   f"(shed {(drop_a - drop_b) // 1000}K) · {n_after} calls since · "
                   f"realized {fmt_money(saved)}{dedupe}")
@@ -1188,10 +1190,12 @@ def trim_transcript(path, keep_turns=15, go=False):
 
 
 def _live_claude_procs(kids, info):
-    """(pid, profile, proj_dir, transcript, mtime) for every running claude."""
+    """(pid, profile, proj_dir, transcript, mtime, is_ancestor) for every
+    running claude. Ancestors (the session foreman itself runs inside) are
+    included so shared-cwd COUNTS stay truthful, but must never be acted on."""
     rows = []
     for pid, (_ppid, _et, comm) in info.items():
-        if comm != "claude" or _is_ancestor(int(pid)):
+        if comm != "claude":
             continue
         env = _proc_env(pid)
         if not env:
@@ -1204,8 +1208,21 @@ def _live_claude_procs(kids, info):
         proj = re.sub(r"[^A-Za-z0-9]", "-", cwd)
         files = glob.glob(os.path.join(profile, "projects", proj, "*.jsonl"))
         f = max(files, key=os.path.getmtime) if files else None
-        rows.append((pid, profile, proj, f, os.path.getmtime(f) if f else 0))
+        rows.append((pid, profile, proj, f, os.path.getmtime(f) if f else 0,
+                     _is_ancestor(int(pid))))
     return rows
+
+
+def _pane_map():
+    """sid -> {pane, transcript, ts} written by the sentinel from inside each
+    session — the ground truth that makes shared cwds resolvable."""
+    out = {}
+    for p in glob.glob(os.path.join(STATE_DIR, "pane-map", "*")):
+        try:
+            out[os.path.basename(p)] = json.load(open(p))
+        except Exception:
+            pass
+    return out
 
 
 def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
@@ -1213,30 +1230,42 @@ def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
     kids, info = _proc_table()
     pane_of = _tmux_pane_index(kids)
     live = _live_claude_procs(kids, info)
-    live_projects = {(p, j) for _, p, j, _, _ in live}
+    live_projects = {(p, j) for _, p, j, _, _, _ in live}
+    procs_in = Counter((p, j) for _, p, j, _, _, _ in live)
     print(f"foreman watch — {'EXECUTING' if go else 'dry-run (--go to execute)'}"
           f"  [fat ≥{ctx_min // 1000}K · idle ≥{idle_min}m · keep last {keep_turns} turns]")
 
+    # resolve pane<->session precisely via the sentinel's pane-map: an entry is
+    # trusted only if a claude process lives under that pane NOW and the entry
+    # was written during that process's lifetime (pane ids are never reused
+    # within a tmux server, so a stale entry simply fails these checks)
+    pane2pid = {}
+    for pid, (_ppid, _et, comm) in info.items():
+        if comm == "claude" and pid in pane_of:
+            p = pane_of[pid][0]
+            if p not in pane2pid or info[pid][1] > info[pane2pid[p]][1]:
+                pane2pid[p] = pid   # oldest claude under the pane = the TUI
+    best = {}   # pid -> (ts, sid, pane, transcript); newest entry wins, since
+    for sid, e in _pane_map().items():   # /clear re-sids the same process
+        pane, tp, ts = e.get("pane"), e.get("transcript"), e.get("ts", 0)
+        pid = pane2pid.get(pane)
+        if not (pid and tp and os.path.exists(tp)):
+            continue
+        if ts < now - info[pid][1]:
+            continue   # entry predates the process now in that pane — stale
+        if pid not in best or ts > best[pid][0]:
+            best[pid] = (ts, sid, pane, tp)
+    resolved = {tp: (sid, pane, pid) for pid, (ts, sid, pane, tp) in best.items()}
+    resolved_pids = set(best)
+
     # arm 1 — LIVE fat idle sessions in calm tmux panes: in-band /compact
     n_compact = 0
-    procs_in = Counter((p, j) for _, p, j, _, _ in live)
-    for pid, profile, proj, f, mt in sorted(live, key=lambda r: -(r[4] or 0)):
-        if not f:
-            continue
-        sid = os.path.basename(f)[:8]
-        ctx = _last_ctx_tail(f)
-        idle = (now - mt) / 60
-        if ctx < ctx_min:
-            continue
-        pane, _sess = pane_of.get(pid, (None, None))
-        state = _pane_state(pane) if pane else "no-tmux"
+
+    def live_row(sid, ctx, idle, pane, state, tag):
+        nonlocal n_compact
         marker = os.path.join(STATE_DIR, f"compacting-{sid}")
         in_flight = os.path.exists(marker) and (now - os.path.getmtime(marker)) < 180
-        if procs_in[(profile, proj)] > 1:
-            # several sessions share this cwd — the pane↔transcript mapping is
-            # a guess, and foreman doesn't act on guesses (restart's rule)
-            verdict = "skip (shared cwd — pane↔session mapping ambiguous)"
-        elif idle < idle_min:
+        if idle < idle_min:
             verdict = f"skip (idle {idle:.0f}m < {idle_min}m)"
         elif not pane:
             verdict = "skip (not in tmux — type the /compact yourself)"
@@ -1256,11 +1285,37 @@ def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
                       f"-> FIRE(watch) mode=auto (watch sweep)")
                 n_compact += 1
         print(f"  LIVE {sid}  ctx {ctx // 1000:>4}K  idle {idle:6.0f}m  "
-              f"pane {pane or '-':<6} {verdict}")
+              f"pane {pane or '-':<6} {verdict}{tag}")
+
+    for tp, (sid, pane, pid) in sorted(resolved.items(),
+                                       key=lambda kv: -os.path.getmtime(kv[0])):
+        ctx = _last_ctx_tail(tp)
+        if ctx < ctx_min:
+            continue
+        idle = max(0.0, (now - os.path.getmtime(tp)) / 60)
+        live_row(sid, ctx, idle, pane, _pane_state(pane), "")
+    unresolved_shared = Counter()
+    for pid, profile, proj, f, mt, is_anc in sorted(live, key=lambda r: -(r[4] or 0)):
+        if not f or pid in resolved_pids or is_anc:
+            continue   # ancestors count toward ambiguity but are never acted on
+        if procs_in[(profile, proj)] > 1:
+            unresolved_shared[(profile, proj)] += 1
+            continue
+        # single process in this cwd — the latest transcript is its session
+        ctx = _last_ctx_tail(f)
+        if ctx < ctx_min:
+            continue
+        pane, _sess = pane_of.get(pid, (None, None))
+        live_row(os.path.basename(f)[:8], ctx, max(0.0, (now - mt) / 60), pane,
+                 _pane_state(pane) if pane else "no-tmux", "")
+    for (profile, proj), n in sorted(unresolved_shared.items()):
+        print(f"  LIVE {proj[:44]}: {n} unmapped session(s) share this cwd — "
+              f"message each once (the sentinel maps pane↔session on any prompt)")
 
     # arm 2 — DEAD fat transcripts: surgical on-disk trim
     n_trim = 0
     seen = set()
+    resolved_sids = {os.path.basename(tp) for tp in resolved}
     for prof in discover_profiles():
         for f in glob.glob(os.path.join(prof, "projects", "*", "*.jsonl")):
             sid = os.path.basename(f)
@@ -1268,8 +1323,15 @@ def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
                 continue
             seen.add(sid)
             proj = os.path.basename(os.path.dirname(f))
+            if f in resolved or sid in resolved_sids:
+                continue   # this transcript IS a running session (any profile)
             if (prof, proj) in live_projects:
-                continue  # a running session lives in this project dir — hands off
+                # trim dead siblings only when every running session in this
+                # dir is pane-mapped — otherwise one of them might be this file
+                n_res = sum(1 for tp in resolved
+                            if os.path.dirname(tp) == os.path.dirname(f))
+                if n_res < procs_in[(prof, proj)]:
+                    continue
             try:
                 st = os.stat(f)
             except OSError:
