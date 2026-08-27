@@ -38,7 +38,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1391,6 +1391,95 @@ def cmd_watch_install():
         print(f"  */15 * * * * {exec_line}")
 
 
+# ──────────────────────────────── style ────────────────────────────────────
+# One command to put an output-style directive everywhere it has to be:
+#   1. always.md   — the sentinel injects it on every prompt, so sessions that
+#                    are ALREADY OPEN obey it on their next message. No hook
+#                    registration, no restart, no /hooks review.
+#   2. CLAUDE.md   — every ~/.claude* profile, so new sessions start with it
+#                    even when the hook is off or foreman is uninstalled.
+# Both are needed: (1) has reach but depends on the hook, (2) is durable but
+# only reaches sessions that have not started yet.
+
+ALWAYS_FILE = os.path.expanduser(
+    os.environ.get("FOREMAN_ALWAYS", os.path.join(STATE_DIR, "always.md")))
+STYLE_DIR = os.path.join(FOREMAN_HOME, "styles")
+STYLE_BEGIN = "<!-- foreman:style:begin -->"
+STYLE_END = "<!-- foreman:style:end -->"
+
+
+def _style_text(name):
+    p = os.path.join(STYLE_DIR, f"{name}.md")
+    if not os.path.exists(p):
+        avail = ", ".join(sorted(
+            os.path.splitext(f)[0] for f in os.listdir(STYLE_DIR))) \
+            if os.path.isdir(STYLE_DIR) else "none"
+        raise SystemExit(f"no style '{name}'. available: {avail}")
+    return open(p).read().strip()
+
+
+def _patch_claude_md(path, block):
+    """Replace the foreman-managed block, or any hand-written '## Response
+    style' section it supersedes, then append. Everything else is preserved."""
+    old = open(path).read() if os.path.exists(path) else ""
+    if STYLE_BEGIN in old and STYLE_END in old:
+        head, rest = old.split(STYLE_BEGIN, 1)
+        tail = rest.split(STYLE_END, 1)[1]
+        old = head.rstrip() + "\n" + tail.lstrip("\n")
+    lines = old.split("\n")
+    out, skipping = [], False
+    for ln in lines:
+        if ln.startswith("## ") and "response style" in ln.lower():
+            skipping = True
+            continue
+        if skipping and ln.startswith("## "):
+            skipping = False
+        if not skipping:
+            out.append(ln)
+    body = "\n".join(out).rstrip()
+    with open(path, "w") as f:
+        f.write(f"{body}\n\n{STYLE_BEGIN}\n## Response style (managed by "
+                f"`foreman style`)\n\n{block}\n{STYLE_END}\n")
+
+
+def cmd_style(action, name="terse"):
+    if action == "show":
+        print(_style_text(name))
+        return
+    if action == "list":
+        for f in sorted(os.listdir(STYLE_DIR)):
+            if f.endswith(".md"):
+                p = os.path.join(STYLE_DIR, f)
+                first = next((l for l in open(p) if l.strip()), "").strip()
+                print(f"  {os.path.splitext(f)[0]:10} {first[:78]}")
+        return
+    if action == "uninstall":
+        for p in [ALWAYS_FILE] if os.path.exists(ALWAYS_FILE) else []:
+            os.remove(p)
+            print(f"  removed {p}")
+        for prof in discover_profiles():
+            md = os.path.join(prof, "CLAUDE.md")
+            if os.path.exists(md) and STYLE_BEGIN in open(md).read():
+                _patch_claude_md(md, "")   # strips the block
+                txt = open(md).read().split(STYLE_BEGIN)[0].rstrip() + "\n"
+                open(md, "w").write(txt)
+                print(f"  cleaned {md}")
+        return
+    block = _style_text(name)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(ALWAYS_FILE, "w") as f:
+        f.write(block + "\n")
+    print(f"  running sessions : {ALWAYS_FILE} (applies on their next message)")
+    for prof in discover_profiles():
+        md = os.path.join(prof, "CLAUDE.md")
+        _patch_claude_md(md, block)
+        print(f"  new sessions     : {md}")
+    print(f"\nstyle '{name}' installed. Undo: foreman style uninstall")
+    if os.environ.get("CLAUDE_CODE_OUTPUT_STYLE", "") not in ("", "default"):
+        print("NOTE: this session runs a non-default output style that may "
+              "conflict — run /output-style default")
+
+
 # ──────────────────────────────── voice ────────────────────────────────────
 # Your transcripts hold thousands of messages YOU typed. `voice build`
 # distills them — one cheap headless model call — into a personal style
@@ -1647,6 +1736,9 @@ def main():
                     help="trim: protect tool payloads within the last N user turns")
     wp.add_argument("--install", action="store_true",
                     help="install a 15-min systemd user timer (or print the cron line)")
+    stp = sub.add_parser("style")
+    stp.add_argument("action", choices=["install", "show", "list", "uninstall"])
+    stp.add_argument("--name", default="terse", help="which style (see: style list)")
     vp = sub.add_parser("voice")
     vp.add_argument("action", choices=["build", "install", "show", "tune", "uninstall"])
     vp.add_argument("text", nargs="?", help='tune: the correction, in your words')
@@ -1676,6 +1768,8 @@ def main():
     elif a.cmd == "watch":
         cmd_watch_install() if a.install else \
             cmd_watch(a.go, a.idle_min, a.ctx_min, a.keep_turns)
+    elif a.cmd == "style":
+        cmd_style(a.action, a.name)
     elif a.cmd == "voice":
         cmd_voice(a.action, a.sample, a.model, a.text)
     elif a.cmd == "update":
