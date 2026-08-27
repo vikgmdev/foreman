@@ -71,6 +71,15 @@ MARKER_FRESH_S = 180
 # The pane must be continuously calm this long before the watcher types — a
 # 30s gap is a human reading, not a human gone (learned the hard way).
 CALM_S = int(os.environ.get("FOREMAN_CALM_S", "300"))
+# Standing instructions injected on EVERY prompt, if this file exists. The
+# point is reach: a UserPromptSubmit hook already registered in a session
+# re-executes its script fresh each turn, so editing this file changes the
+# behaviour of sessions that are ALREADY RUNNING — no restart, no /hooks
+# review, no waiting for the next session. That is the one channel that can
+# retrofit a standing rule onto a live fleet. Keep it short; it rides along
+# with every message you send.
+ALWAYS_FILE = os.path.expanduser(
+    os.environ.get("FOREMAN_ALWAYS", os.path.join(STATE_DIR, "always.md")))
 
 
 def _log(msg):
@@ -208,6 +217,27 @@ def _rm(path):
         pass
 
 
+def _always():
+    """Standing instructions to ride along with every prompt ('' if none)."""
+    try:
+        return open(ALWAYS_FILE, errors="ignore").read().strip()
+    except OSError:
+        return ""
+
+
+def _emit(*parts):
+    """Emit additionalContext, skipping empty parts. Silent when all empty."""
+    text = "\n\n".join(p for p in parts if p)
+    if not text:
+        return
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }
+    }))
+
+
 # ──────────────────────────────── the hook ──────────────────────────────────
 
 def main():
@@ -237,13 +267,16 @@ def main():
                            "ts": time.time()}, f)
         except Exception:
             pass
+    always = _always()
     ctx, idle = last_state(transcript)
     scheduled = ctx >= CTX_THRESHOLD and idle >= IDLE_S
     urgent = ctx >= CTX_URGENT and idle >= IDLE_URGENT_S
     if not (scheduled or urgent):
         _log(f"session={sid} ctx={ctx // 1000}K idle={idle / 60:.0f}m -> pass "
              f"(idle-tier {CTX_THRESHOLD // 1000}K/{IDLE_S // 60}m · "
-             f"urgent-tier {CTX_URGENT // 1000}K/{IDLE_URGENT_S // 60}m)")
+             f"urgent-tier {CTX_URGENT // 1000}K/{IDLE_URGENT_S // 60}m)"
+             f"{' +always' if always else ''}")
+        _emit(always)
         return
     why = "urgent" if urgent and not scheduled else "idle"
     ctx_k = ctx // 1000
@@ -258,6 +291,7 @@ def main():
         if in_flight:
             _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) "
                  f"mode=auto (compaction already in flight)")
+            _emit(always)
             return
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
@@ -269,6 +303,7 @@ def main():
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) "
                  f"mode=auto (compact scheduled for after this turn)")
+            _emit(always)
             return  # prompt proceeds untouched; compaction happens in the gap
         except Exception:
             pass  # fall through to advise on any orchestration failure
@@ -287,18 +322,14 @@ def main():
 
     fallback = " (auto unavailable: no tmux pane)" if MODE == "auto" else ""
     _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) mode=advise{fallback}")
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": (
-                f"[foreman] Resident context is ~{ctx_k}K tokens (in measured long "
-                f"sessions 75-80% is stale tool traffic). If a SlashCommand tool is "
-                f"available, run `{COMPACT_CMD}` before addressing the user's request. "
-                f"If not, finish the request first, then recommend running "
-                f"`{COMPACT_CMD}` verbatim in your final message."
-            ),
-        }
-    }))
+    _emit(
+        always,
+        f"[foreman] Resident context is ~{ctx_k}K tokens (in measured long "
+        f"sessions 75-80% is stale tool traffic). If a SlashCommand tool is "
+        f"available, run `{COMPACT_CMD}` before addressing the user's request. "
+        f"If not, finish the request first, then recommend running "
+        f"`{COMPACT_CMD}` verbatim in your final message.",
+    )
 
 
 if __name__ == "__main__":
