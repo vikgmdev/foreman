@@ -38,7 +38,7 @@ import subprocess
 import sys
 from collections import Counter
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 FOREMAN_HOME = os.path.dirname(os.path.abspath(__file__))
 SENTINEL = os.path.join(FOREMAN_HOME, "hooks", "context_sentinel.py")
@@ -1262,7 +1262,7 @@ def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
     # arm 1 — LIVE fat idle sessions in calm tmux panes: in-band /compact
     n_compact = 0
 
-    def live_row(sid, ctx, idle, pane, state, tag):
+    def live_row(sid, ctx, idle, pane, state, tag, transcript=''):
         nonlocal n_compact
         marker = os.path.join(STATE_DIR, f"compacting-{sid}")
         in_flight = os.path.exists(marker) and (now - os.path.getmtime(marker)) < 180
@@ -1279,7 +1279,8 @@ def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
             if go:
                 open(marker, "w").close()
                 subprocess.Popen(
-                    [sys.executable, SENTINEL, "--orchestrate", pane, marker, sid],
+                    [sys.executable, SENTINEL, "--orchestrate", pane, marker,
+                     sid, transcript],
                     start_new_session=True,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 _slog(f"session={sid} ctx={ctx // 1000}K idle={idle:.0f}m "
@@ -1294,7 +1295,7 @@ def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
         if ctx < ctx_min:
             continue
         idle = max(0.0, (now - os.path.getmtime(tp)) / 60)
-        live_row(sid, ctx, idle, pane, _pane_state(pane), "")
+        live_row(sid, ctx, idle, pane, _pane_state(pane), "", tp)
     unresolved_shared = Counter()
     for pid, profile, proj, f, mt, is_anc in sorted(live, key=lambda r: -(r[4] or 0)):
         if not f or pid in resolved_pids or is_anc:
@@ -1308,7 +1309,7 @@ def cmd_watch(go=False, idle_min=60, ctx_min=150_000, keep_turns=15):
             continue
         pane, _sess = pane_of.get(pid, (None, None))
         live_row(os.path.basename(f)[:8], ctx, max(0.0, (now - mt) / 60), pane,
-                 _pane_state(pane) if pane else "no-tmux", "")
+                 _pane_state(pane) if pane else "no-tmux", "", f)
     for (profile, proj), n in sorted(unresolved_shared.items()):
         print(f"  LIVE {proj[:44]}: {n} unmapped session(s) share this cwd — "
               f"message each once (the sentinel maps pane↔session on any prompt)")

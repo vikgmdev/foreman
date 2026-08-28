@@ -145,6 +145,23 @@ def _pane_calm(pane):
     return bool(prompts) and not any(l.lstrip().lstrip("❯").strip() for l in prompts)
 
 
+def _transcript_quiet(transcript, seconds):
+    """True when nothing has been written to the session for `seconds`.
+
+    The pane is not enough. A session that dispatched background subagents,
+    or that is driven from the web/mobile client instead of this terminal,
+    shows an empty prompt while work is still running. The transcript is the
+    honest signal: every turn, every subagent result, every tool call appends
+    to it. If it has been silent this long, the session really is between
+    tasks. This is what stops a /compact from landing mid-work."""
+    if not transcript:
+        return True
+    try:
+        return (time.time() - os.path.getmtime(transcript)) >= seconds
+    except OSError:
+        return True
+
+
 def _cmd_stuck(pane):
     """True if our /compact is still sitting unsent in the input box."""
     out = subprocess.run(["tmux", "capture-pane", "-t", pane, "-p"],
@@ -153,7 +170,7 @@ def _cmd_stuck(pane):
                for l in out.splitlines())
 
 
-def orchestrate(pane, marker, sid):
+def orchestrate(pane, marker, sid, transcript=""):
     """Runs DETACHED after the user's prompt went through untouched: wait for
     the turn to finish and the pane to stay CONTINUOUSLY calm for CALM_S
     (default 5 min — a human pausing to read is not a human gone), then type
@@ -170,13 +187,20 @@ def orchestrate(pane, marker, sid):
             os.utime(marker, None)       # heartbeat: holds the in-flight lock
         except OSError:
             pass
-        stable = stable + 1 if _pane_calm(pane) else 0
+        calm = _pane_calm(pane) and _transcript_quiet(transcript, CALM_S)
+        stable = stable + 1 if calm else 0
         if stable >= need:
             break
         time.sleep(10)
     else:
-        _log(f"session={sid} auto: no {CALM_S // 60}m-calm gap within 45m — "
-             f"skipped, will retry on next trigger")
+        _log(f"session={sid} auto: no {CALM_S // 60}m-calm gap within 45m "
+             f"(pane or transcript still active) — skipped, will retry")
+        _rm(marker)
+        return
+    # Last check immediately before typing: a subagent can finish and write to
+    # the transcript inside the final sleep window.
+    if not (_pane_calm(pane) and _transcript_quiet(transcript, 30)):
+        _log(f"session={sid} auto: activity resumed at the last moment — aborted")
         _rm(marker)
         return
     subprocess.run(["tmux", "send-keys", "-t", pane, "-l", COMPACT_CMD])
@@ -298,7 +322,7 @@ def main():
             open(marker, "w").close()
             subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__),
-                 "--orchestrate", pane, marker, sid],
+                 "--orchestrate", pane, marker, sid, transcript],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _log(f"session={sid} ctx={ctx_k}K idle={idle / 60:.0f}m -> FIRE({why}) "
@@ -335,7 +359,7 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) >= 5 and sys.argv[1] == "--orchestrate":
         try:
-            orchestrate(sys.argv[2], sys.argv[3], sys.argv[4])
+            orchestrate(*sys.argv[2:6])
         except Exception as e:
             _log(f"auto: orchestrator crashed: {e}")
         sys.exit(0)
